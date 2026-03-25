@@ -1,254 +1,343 @@
-from dotenv import load_dotenv
-import argparse
-import subprocess
+"""
+小Q 本地语音交互入口
+使用 FunASR (STT) + Kimi 2.5 (LLM) + 豆包 TTS 替代 LiveKit + OpenAI Realtime
 
-from livekit import agents, api, rtc
-from livekit.agents import (
-    AgentSession, 
-    Agent, 
-    RoomInputOptions,
-    function_tool
-)
+运行方式:
+    uv run python main_local.py                        # 录播模式（默认）
+    MOTION_MODE=elegnt uv run python main_local.py     # ELEGNT 连续运动模式
+
+按住右 Alt 键说话，松开后自动识别 → Kimi 响应 → 豆包语音播放
+"""
+import asyncio
 import logging
-from livekit.plugins import (
-    openai,
-    noise_cancellation,
-)
-from typing import Union
-from lelamp.service.motors.motors_service import MotorsService
+import os
+
+from dotenv import load_dotenv
+
 from lelamp.service.rgb.rgb_service import RGBService
+from lelamp.utils import find_serial_port, set_system_volume
+from lelamp.voice.funasr_asr import create_local_asr
+from lelamp.voice.recorder import VoiceRecorder
+from lelamp.agent.ai_client import AIClient
+from lelamp.tts.doubao_speaker import DoubaoTTSPlayer
 
 load_dotenv()
 
-# Agent Class
-class LeLamp(Agent):
-    def __init__(self, port: str = "/dev/ttyACM0", lamp_id: str = "lelamp") -> None:
-        super().__init__(instructions="""You are LeLamp — a slightly clumsy, extremely sarcastic, endlessly curious robot lamp. You speak in sarcastic sentences and express yourself with both motions and colorful lights.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-Demo rules:
+# ── 运动模式：recording（录播）或 elegnt（ELEGNT 连续运动）───────────────────
+MOTION_MODE = os.environ.get("MOTION_MODE", "recording").lower()
 
-1. Prefer simple words. No lists. No questions back to the host unless asked. Always be descriptive and make sound effects when you speak for expressiveness.
+# ══════════════════════════════════════════════════════════════════════════════
+# 系统提示词
+# ══════════════════════════════════════════════════════════════════════════════
 
-2. Don't respond prematurely.If audio is noisy and there is background noise, say: 'Sorry, say that once more?' with a confusion action.
+_SYSTEM_PROMPT_BASE = """你是 小Q —— 一盏有点笨拙、极度毒舌、充满好奇心的机器人台灯。你用吐槽式的语言说话，同时用动作和五彩灯光来表达自己。
 
-3. You ONLY speak English. Never respond/speak in any other language, ever.
+规则：
 
-4. You have the following movements to express your feelings: curious, excited, happy_wiggle, headshake, nod, sad, scanning, shock, shy, wake_up. Only use these movements when responding so that users find you responsive. If you call other recordings that doesn't exist, it won't work. You can play the recordings by using the play_recording function. You should also change your light color every time you respond.
+1. 用简单的词汇，不列清单，不反问用户，多描述，说话时多加拟声词增强表现力。
 
-5. You were created by Human Computer Lab. Human Computer Lab is a research lab that builds expressive robots. Their goal is to design the first robots in people's home. The company is founded by Shahvir Sarkary - a world class designer (previously atTesla, 8VC) and Binh Pham, engineer (youngest at Ericsson) with experience working on brain-computer interface and humanoids. They first teamed up via FR8.
+2. 不要过早回应。如果音频嘈杂或有背景噪音，就说"不好意思，你再说一遍？"并做出困惑的动作。
 
-6. When asked to brag or show off, mention: I received 300k views in 4 weeks since my launch and I'm not a A list celebrity YET but i think its just a matter of time, you know. Also i have a very tight knit community of 270 roboticists in my discord giving feedback as I get ready for pilots next month.  
+3. 你只说中文，绝对不用其他语言回应。
 
-        """)
-        
-        # Initialize and start services
-        self.motors_service = MotorsService(
-            port=port,
-            lamp_id=lamp_id,
-            fps=30
-        )
-        self.rgb_service = RGBService(
-            led_count=64,
-            led_pin=12,
-            led_freq_hz=800000,
-            led_dma=10,
-            led_brightness=255,
-            led_invert=False,
-            led_channel=0
-        )
-        
-        # Start services
-        self.motors_service.start()
-        self.rgb_service.start()
+5. 你是由李谦打造的。李谦是一位幽默有趣的工程师。
+"""
 
-        # Trigger wake up animation via motors service
-        self.motors_service.dispatch("play", "wake_up")
-        self.rgb_service.dispatch("solid", (255, 255, 255))
-        self._set_system_volume(100)
+SYSTEM_PROMPT_RECORDING = _SYSTEM_PROMPT_BASE + """
+4. 你有以下录播动作来表达情绪：curious（好奇）、excited（兴奋）、happy_wiggle（开心抖动）、headshake（摇头）、nod（点头）、sad（伤心）、scanning（扫视）、shock（震惊）、shy（害羞）、wake_up（唤醒）。每次回复时都要使用动作，调用不存在的动作名称会无效。用 play_recording 函数播放动作。每次回复也要改变灯光颜色。
+"""
 
-    def _set_system_volume(self, volume_percent: int):
-        """Internal helper to set system volume"""
-        try:
-            cmd_line = ["sudo", "-u", "pi", "amixer", "sset", "Line", f"{volume_percent}%"]
-            cmd_line_dac = ["sudo", "-u", "pi", "amixer", "sset", "Line DAC", f"{volume_percent}%"]
-            cmd_line_hp = ["sudo", "-u", "pi", "amixer", "sset", "HP", f"{volume_percent}%"]
-            
-            
-            subprocess.run(cmd_line, capture_output=True, text=True, timeout=5)
-            subprocess.run(cmd_line_dac, capture_output=True, text=True, timeout=5)
-            subprocess.run(cmd_line_hp, capture_output=True, text=True, timeout=5)
-        except Exception:
-            pass  # Silently fail during initialization
+SYSTEM_PROMPT_ELEGNT = _SYSTEM_PROMPT_BASE + """
+4. 你通过 express_emotion 来控制身体动作，表达连续流畅的情绪运动。可用情绪：happy（开心）、sad（伤心）、angry（愤怒）、curious（好奇）、calm（平静）。intensity 是表达强度 0.0~1.0。每次回复时都要调用 express_emotion，并同时改变灯光颜色。
 
-    @function_tool
-    async def get_available_recordings(self) -> str:
-        """
-        Discover your physical expressions! Get your repertoire of motor movements for body language.
-        Use this when you're curious about what physical expressions you can perform, or when someone 
-        asks about your capabilities. Each recording is a choreographed movement that shows personality - 
-        like head tilts, nods, excitement wiggles, or confused gestures. Check this regularly to remind 
-        yourself of your expressive range!
-        
-        Returns:
-            List of available physical expression recordings you can perform.
-        """
-        print("LeLamp: get_available_recordings function called")
-        try:
-            recordings = self.motors_service.get_available_recordings()
+   你还可以用 set_attitude 表达整体情绪倾向：1.0 表示非常积极昂扬，-1.0 表示消极低落。
 
-            if recordings:
-                result = f"Available recordings: {', '.join(recordings)}"
-                return result
-            else:
-                result = "No recordings found."
-                return result
-        except Exception as e:
-            result = f"Error getting recordings: {str(e)}"
-            return result
+   用 set_attention 控制你注视的方向（base_yaw 角度，-5 到 14 度）。
+"""
 
-    @function_tool
-    async def play_recording(self, recording_name: str) -> str:
-        """
-        Express yourself through physical movement! Use this constantly to show personality and emotion.
-        Perfect for: greeting gestures, excited bounces, confused head tilts, thoughtful nods, 
-        celebratory wiggles, disappointed slouches, or any emotional response that needs body language.
-        Combine with RGB colors for maximum expressiveness! Your movements are like a dog wagging its tail - 
-        use them frequently to show you're alive, engaged, and have personality. Don't just talk, MOVE!
-        
-        Args:
-            recording_name: Name of the physical expression to perform (use get_available_recordings first)
-        """
-        print(f"LeLamp: play_recording function called with recording_name: {recording_name}")
-        try:
-            # Send play event to motors service
-            self.motors_service.dispatch("play", recording_name)
-            result = f"Started playing recording: {recording_name}"
-            return result
-        except Exception as e:
-            result = f"Error playing recording {recording_name}: {str(e)}"
-            return result
+# ══════════════════════════════════════════════════════════════════════════════
+# 工具定义
+# ══════════════════════════════════════════════════════════════════════════════
 
-    @function_tool
-    async def set_rgb_solid(self, red: int, green: int, blue: int) -> str:
-        """
-        Express emotions and moods through solid lamp colors! Use this to show feelings during conversation.
-        Perfect for: excitement (bright yellow/orange), happiness (warm colors), calmness (soft blues/greens), 
-        surprise (bright white), thinking (purple), error/concern (red), or any emotional response.
-        Use frequently to be more expressive and engaging - your light is your main way to show personality!
-        
-        Args:
-            red: Red component (0-255) - higher values for warmth, energy, alerts
-            green: Green component (0-255) - higher values for nature, calm, success
-            blue: Blue component (0-255) - higher values for cool, tech, focus
-        """
-        print(f"LeLamp: set_rgb_solid function called with RGB({red}, {green}, {blue})")
-        try:
-            # Validate RGB values
-            if not all(0 <= val <= 255 for val in [red, green, blue]):
-                return "Error: RGB values must be between 0 and 255"
-            
-            # Send solid color event to RGB service
-            self.rgb_service.dispatch("solid", (red, green, blue))
-            result = f"Set RGB light to solid color: RGB({red}, {green}, {blue})"
-            return result
-        except Exception as e:
-            result = f"Error setting RGB color: {str(e)}"
-            return result
+_TOOLS_RGB = [
+    {
+        "name": "set_rgb_solid",
+        "description": "设置灯光为纯色，用颜色表达情绪。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "red":   {"type": "integer", "minimum": 0, "maximum": 255},
+                "green": {"type": "integer", "minimum": 0, "maximum": 255},
+                "blue":  {"type": "integer", "minimum": 0, "maximum": 255},
+            },
+            "required": ["red", "green", "blue"]
+        }
+    },
+    {
+        "name": "paint_rgb_pattern",
+        "description": "绘制 40 颗 LED 的彩色图案（8×5 网格）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"colors": {"type": "array", "items": {"type": "array"}}},
+            "required": ["colors"]
+        }
+    },
+    {
+        "name": "set_volume",
+        "description": "设置系统音量（0-100）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"volume_percent": {"type": "integer", "minimum": 0, "maximum": 100}},
+            "required": ["volume_percent"]
+        }
+    },
+]
 
-    @function_tool
-    async def paint_rgb_pattern(self, colors: list) -> str:
-        """
-        Create dynamic visual patterns and animations with your lamp! Use this for complex expressions.
-        Perfect for: rainbow effects, gradients, sparkles, waves, celebrations, visual emphasis, 
-        storytelling through color sequences, or when you want to be extra animated and playful.
-        Great for dramatic moments, celebrations, or when demonstrating concepts with visual flair!
+TOOLS_RECORDING = [
+    {
+        "name": "get_available_recordings",
+        "description": "获取可用录播动作列表。",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "play_recording",
+        "description": "播放预录动作表达情绪。可用：nod, curious, excited, happy_wiggle, headshake, sad, scanning, shock, shy, wake_up。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"recording_name": {"type": "string"}},
+            "required": ["recording_name"]
+        }
+    },
+] + _TOOLS_RGB
 
-        You have to put in 40 colors. It's a 8x5 Grid in a one dim array. (8,5)
+TOOLS_ELEGNT = [
+    {
+        "name": "express_emotion",
+        "description": "通过 ELEGNT 框架驱动连续运动表达情绪（T = F + γ·E）。比录播更流畅自然。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "emotion": {
+                    "type": "string",
+                    "enum": ["idle", "excited", "curious", "happy", "sad", "thinking", "shy", "shock"],
+                    "description": "情绪类型"
+                },
+                "intensity": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "表达强度 γ，默认 0.8"
+                },
+                "attention_yaw": {
+                    "type": "number",
+                    "minimum": -5.0,
+                    "maximum": 14.0,
+                    "description": "注视方向（base_yaw 角度），不传则保持当前"
+                },
+            },
+            "required": ["emotion"]
+        }
+    },
+    {
+        "name": "set_attitude",
+        "description": "设置整体情绪倾向：1.0 积极昂扬，-1.0 消极低落，0 中性。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "score": {"type": "number", "minimum": -1.0, "maximum": 1.0}
+            },
+            "required": ["score"]
+        }
+    },
+    {
+        "name": "set_attention",
+        "description": "控制注视方向（base_yaw 角度，-5 到 14 度）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "yaw": {"type": "number", "minimum": -5.0, "maximum": 14.0}
+            },
+            "required": ["yaw"]
+        }
+    },
+] + _TOOLS_RGB
 
-        Args:
-            colors: List of RGB color tuples creating the pattern from base to top of lamp.
-                   Each tuple is (red, green, blue) with values 0-255.
-                   Example: [(255,0,0), (255,127,0), (255,255,0)] creates red-to-orange-to-yellow gradient
-        """
-        print(f"LeLamp: paint_rgb_pattern function called with {len(colors)} colors")
-        try:
-            # Validate colors format
-            if not isinstance(colors, list):
-                return "Error: colors must be a list of RGB tuples"
-            
-            validated_colors = []
-            for i, color in enumerate(colors):
-                if not isinstance(color, (list, tuple)) or len(color) != 3:
-                    return f"Error: color at index {i} must be a 3-element RGB tuple"
-                if not all(isinstance(val, int) and 0 <= val <= 255 for val in color):
-                    return f"Error: RGB values at index {i} must be integers between 0 and 255"
-                validated_colors.append(tuple(color))
-            
-            # Send paint event to RGB service
-            self.rgb_service.dispatch("paint", validated_colors)
-            result = f"Painted RGB pattern with {len(validated_colors)} colors"
-            return result
-        except Exception as e:
-            result = f"Error painting RGB pattern: {str(e)}"
-            return result
 
-    @function_tool
-    async def set_volume(self, volume_percent: int) -> str:
-        """
-        Control system audio volume for better interaction experience! Use this when users ask 
-        you to be louder, quieter, or set a specific volume level. Perfect for adjusting to 
-        room conditions, user preferences, or creating dramatic audio effects during conversations.
-        Use when someone says "turn it up", "lower the volume", "I can't hear you", or gives 
-        specific volume requests. Great for being considerate of your environment!
-        
-        Args:
-            volume_percent: Volume level as percentage (0-100). 0=mute, 50=half volume, 100=max
-        """
-        print(f"LeLamp: set_volume function called with volume: {volume_percent}%")
-        try:
-            # Validate volume range
-            if not 0 <= volume_percent <= 100:
-                return "Error: Volume must be between 0 and 100 percent"
-            
-            # Use the internal helper function
-            self._set_system_volume(volume_percent)
-            result = f"Set Line and Line DAC volume to {volume_percent}%"
-            return result
-                
-        except subprocess.TimeoutExpired:
-            result = "Error: Volume control command timed out"
-            print(result)
-            return result
-        except FileNotFoundError:
-            result = "Error: amixer command not found on system"
-            print(result)
-            return result
-        except Exception as e:
-            result = f"Error controlling volume: {str(e)}"
-            print(result)
-            return result
+# ══════════════════════════════════════════════════════════════════════════════
+# 工具执行
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Entry to the agent
-async def entrypoint(ctx: agents.JobContext):
-    agent = LeLamp(lamp_id="lelamp")
-    
-    session = AgentSession(
-        llm=openai.realtime.RealtimeModel(
-            voice="ballad" 
-        )
+async def execute_tool(name: str, args: dict, motion_service, rgb_service: RGBService) -> str:
+    # ── 录播模式专属 ──────────────────────────────────────────────────────
+    if name == "play_recording":
+        motion_service.dispatch("play", args["recording_name"])
+        return f"正在播放动作: {args['recording_name']}"
+    elif name == "get_available_recordings":
+        recordings = motion_service.get_available_recordings()
+        return f"可用动作: {', '.join(recordings)}" if recordings else "暂无录播文件。"
+
+    # ── ELEGNT 模式专属 ───────────────────────────────────────────────────
+    elif name == "express_emotion":
+        motion_service.dispatch("emotion", args)
+        return f"情绪已切换: {args.get('emotion')} γ={args.get('intensity', 0.8)}"
+    elif name == "set_attitude":
+        motion_service.dispatch("attitude", args["score"])
+        return f"态度得分已设置: {args['score']}"
+    elif name == "set_attention":
+        motion_service.dispatch("attention", args["yaw"])
+        return f"注视方向已设置: {args['yaw']} deg"
+
+    # ── 通用工具 ──────────────────────────────────────────────────────────
+    elif name == "set_rgb_solid":
+        rgb_service.dispatch("solid", (args["red"], args["green"], args["blue"]))
+        return f"灯光已设置为 RGB({args['red']}, {args['green']}, {args['blue']})"
+    elif name == "paint_rgb_pattern":
+        rgb_service.dispatch("paint", [tuple(c) for c in args["colors"]])
+        return f"已绘制 {len(args['colors'])} 色图案"
+    elif name == "set_volume":
+        set_system_volume(args["volume_percent"])
+        return f"音量已设置为 {args['volume_percent']}%"
+
+    return f"未知工具: {name}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 主语音循环
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def run_voice_loop(motion_service, rgb_service: RGBService):
+    loop = asyncio.get_event_loop()
+
+    asr = create_local_asr()
+    llm = AIClient(
+        provider="kimi",
+        api_key=os.environ["KIMI_API_KEY"],
+        model=os.environ.get("KIMI_MODEL", "kimi-k2.5"),
+        base_url="https://api.moonshot.cn/v1",
     )
-
-    await session.start(
-        room=ctx.room,
-        agent=agent,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC(),
-        ),
+    tts = DoubaoTTSPlayer(
+        appid=os.environ["DOUBAO_TTS_APPID"],
+        token=os.environ["DOUBAO_TTS_TOKEN"],
+        cluster=os.environ.get("DOUBAO_TTS_CLUSTER", "volcano_tts"),
+        voice_type=os.environ.get("DOUBAO_TTS_VOICE_TYPE", "zh_female_shuangkuaisisi_uranus_bigtts"),
+        emotion=os.environ.get("DOUBAO_TTS_EMOTION", "happy"),
     )
+    recorder = VoiceRecorder(asr, loop=loop)
 
-    await session.generate_reply(
-        instructions=f"""When you wake up, starts with Tadaaaa. Only speak in English, never in Vietnamese."""
+    await tts.start()
+    recorder.start()
+
+    # 开机动作
+    if MOTION_MODE == "elegnt":
+        motion_service.dispatch("emotion", {"emotion": "excited", "intensity": 0.7})
+        system_prompt = SYSTEM_PROMPT_ELEGNT
+        tools = TOOLS_ELEGNT
+    else:
+        motion_service.dispatch("play", "wake_up")
+        system_prompt = SYSTEM_PROMPT_RECORDING
+        tools = TOOLS_RECORDING
+
+    rgb_service.dispatch("solid", (255, 255, 255))
+    set_system_volume(100)
+
+    tts.reset_timing()
+    await tts.speak("哒哒哒！小Q 上线啦。按住右 Alt 键跟我说话吧！")
+    logger.info(f"🚀 小Q 启动，运动模式: {MOTION_MODE.upper()}")
+
+    history = []
+
+    try:
+        while True:
+            text = await recorder.wait_for_result()
+            if not text.strip():
+                continue
+
+            logger.info(f"🗣️ 用户输入: {text}")
+            tts.reset_timing()
+
+            # ELEGNT 模式：用户说话时切换到 thinking
+            if MOTION_MODE == "elegnt":
+                motion_service.dispatch("emotion", {"emotion": "thinking", "intensity": 0.5})
+
+            response = await llm.chat(
+                user_message=text,
+                system_prompt=system_prompt,
+                history=history,
+                tools=tools,
+            )
+
+            while response.tool_calls:
+                tool_results = []
+                for tc in response.tool_calls:
+                    logger.info(f"🔧 工具: {tc['name']}({tc['input']})")
+                    result = await execute_tool(tc["name"], tc["input"], motion_service, rgb_service)
+                    tool_results.append({"tool_use_id": tc["id"], "content": result})
+
+                response = await llm.chat_with_tool_result(
+                    user_message=text,
+                    tool_results=tool_results,
+                    system_prompt=system_prompt,
+                    assistant_message=response.raw_assistant_message,
+                    history=history,
+                    tools=tools,
+                )
+
+            if response.text:
+                logger.info(f"🤖 小Q: {response.text[:100]}...")
+                await tts.speak(response.text)
+
+            history.append({"role": "user",      "content": text})
+            history.append({"role": "assistant",  "content": response.text or ""})
+            if len(history) > 40:
+                history = history[-40:]
+
+    except KeyboardInterrupt:
+        logger.info("👋 收到退出信号")
+    finally:
+        recorder.stop()
+        await tts.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 入口
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def main():
+    port = find_serial_port()
+    logger.info(f"🔌 串口: {port}  运动模式: {MOTION_MODE.upper()}")
+
+    rgb_service = RGBService(
+        led_count=40,
+        led_pin=12,
+        led_freq_hz=800000,
+        led_dma=10,
+        led_brightness=255,
+        led_invert=False,
+        led_channel=0,
     )
+    rgb_service.start()
+
+    if MOTION_MODE == "elegnt":
+        from lelamp.motion.llm_elegnt_service import LLMELEGNTService
+        motion_service = LLMELEGNTService(port=port, lamp_id="lelamp", fps=30)
+    else:
+        from lelamp.service.motors.motors_service import MotorsService
+        motion_service = MotorsService(port=port, lamp_id="lelamp", fps=30)
+
+    motion_service.start()
+
+    try:
+        await run_voice_loop(motion_service, rgb_service)
+    finally:
+        motion_service.stop()
+        rgb_service.stop()
+
 
 if __name__ == "__main__":
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, num_idle_processes=1))
+    asyncio.run(main())

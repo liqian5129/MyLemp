@@ -15,7 +15,7 @@ from livekit.plugins import (
     noise_cancellation,
 )
 from typing import Union
-from lelamp.service.motors.animation_service import AnimationService
+from lelamp.service.motors.motors_service import MotorsService
 from lelamp.service.rgb.rgb_service import RGBService
 from lelamp.utils import find_serial_port, set_system_volume
 
@@ -45,15 +45,13 @@ Demo rules:
         """)
         
         # Initialize and start services
-        self.animation_service = AnimationService(
+        self.motors_service = MotorsService(
             port=port,
             lamp_id=lamp_id,
-            fps=30,
-            duration=3.0,
-            idle_recording="idle"
+            fps=30
         )
         self.rgb_service = RGBService(
-            led_count=40,
+            led_count=64,
             led_pin=12,
             led_freq_hz=800000,
             led_dma=10,
@@ -63,11 +61,11 @@ Demo rules:
         )
         
         # Start services
-        self.animation_service.start()
+        self.motors_service.start()
         self.rgb_service.start()
 
-        # Trigger wake up animation via animation service
-        self.animation_service.dispatch("play", "wake_up")
+        # Trigger wake up animation via motors service
+        self.motors_service.dispatch("play", "wake_up")
         self.rgb_service.dispatch("solid", (255, 255, 255))
         set_system_volume(100)
 
@@ -85,7 +83,7 @@ Demo rules:
         """
         print("LeLamp: get_available_recordings function called")
         try:
-            recordings = self.animation_service.get_available_recordings()
+            recordings = self.motors_service.get_available_recordings()
 
             if recordings:
                 result = f"Available recordings: {', '.join(recordings)}"
@@ -111,8 +109,8 @@ Demo rules:
         """
         print(f"LeLamp: play_recording function called with recording_name: {recording_name}")
         try:
-            # Send play event to animation service
-            self.animation_service.dispatch("play", recording_name)
+            # Send play event to motors service
+            self.motors_service.dispatch("play", recording_name)
             result = f"Started playing recording: {recording_name}"
             return result
         except Exception as e:
