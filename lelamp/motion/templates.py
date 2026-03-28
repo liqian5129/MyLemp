@@ -38,11 +38,13 @@ EMOTION_INDEX = ["happy", "sad", "angry", "curious", "calm"]
 class MotionKeyframes:
     """
     与 LLM 输出接口兼容的动作关键帧结构。
-    f1, f2 为中间两帧（5维），f0/f3 由调用方注入。
+    f1, f2 为中间两帧（5维），f0 由调用方注入（当前关节角）。
+    f3 为动作收束姿态：模板自动计算，LLM 可自定义（软约束：偏离 Q_REST ≤ 30°）。
     lma_* 和 intent 字段仅用于调试日志，不进入下游计算。
     """
-    f1: np.ndarray          # (N_JOINTS,)
-    f2: np.ndarray          # (N_JOINTS,)
+    f1: np.ndarray          # (N_JOINTS,) 情绪高峰帧（绝对角度）
+    f2: np.ndarray          # (N_JOINTS,) 回落缓冲帧（绝对角度）
+    f3: np.ndarray          # (N_JOINTS,) 收束/停留姿态（绝对角度，偏离 Q_REST ≤ 30°）
     duration: float         # 秒 [0.5, 5.0]
     accel_ratio: float      # [0.05, 0.50]
     asymmetry: float        # [-1.0, +1.0]
@@ -228,9 +230,14 @@ def template_generate(emotion: str, intensity: float) -> MotionKeyframes:
     accel_ratio = float(np.clip(t["accel_ratio"], 0.05, 0.50))
     asymmetry   = float(np.clip(t["asymmetry"] * intensity_clipped, -1.0, 1.0))
 
+    # f3：在 f2 方向上保留 30% 偏移，自然收束而非立刻"立正"
+    f3 = Q_REST + (f2 - Q_REST) * 0.3
+    f3 = np.clip(f3, Q_MIN, Q_MAX)
+
     return MotionKeyframes(
         f1=f1,
         f2=f2,
+        f3=f3,
         duration=duration,
         accel_ratio=accel_ratio,
         asymmetry=asymmetry,

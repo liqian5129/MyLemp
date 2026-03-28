@@ -187,6 +187,11 @@ class FunasrASR:
         logger.info(f"🛑 FunASR stop(): {elapsed:.0f}ms, 结果='{text}'")
         return text
 
+    def wait_ready(self, timeout: float = 120.0) -> bool:
+        """阻塞等待模型加载完成。返回 True=成功，False=超时或失败。"""
+        self._model_ready.wait(timeout=timeout)
+        return self._model_loaded
+
     def is_active(self) -> bool:
         return self._model_loaded
 

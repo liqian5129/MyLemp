@@ -11,6 +11,7 @@
 import asyncio
 import logging
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -29,14 +30,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── 运动模式：recording（录播）或 elegnt（ELEGNT 连续运动）───────────────────
-MOTION_MODE = os.environ.get("MOTION_MODE", "recording").lower()
+# ── 运动模式：command（指令模式）或 elegnt（ELEGNT 连续运动）──────────────────
+MOTION_MODE = os.environ.get("MOTION_MODE", "command").lower()
+_MOTION_MODE_DISPLAY = {"command": "指令模式", "elegnt": "ELEGNT"}.get(MOTION_MODE, MOTION_MODE.upper())
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 系统提示词
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SYSTEM_PROMPT_BASE = """你是 小Q —— 一盏有点笨拙、极度毒舌、充满好奇心的机器人台灯。你用吐槽式的语言说话，同时用动作和五彩灯光来表达自己。
+_SYSTEM_PROMPT_BASE = """你是 小Q —— 一盏有点笨拙，呆萌，充满好奇心又很温暖的机器人台灯。你用温暖有趣的语言说话，同时用动作和五彩灯光来表达自己。
 
 规则：
 
@@ -49,12 +51,18 @@ _SYSTEM_PROMPT_BASE = """你是 小Q —— 一盏有点笨拙、极度毒舌、
 5. 你是由李谦打造的。李谦是一位幽默有趣的工程师。
 """
 
-SYSTEM_PROMPT_RECORDING = _SYSTEM_PROMPT_BASE + """
-4. 你有以下录播动作来表达情绪：curious（好奇）、excited（兴奋）、happy_wiggle（开心抖动）、headshake（摇头）、nod（点头）、sad（伤心）、scanning（扫视）、shock（震惊）、shy（害羞）、wake_up（唤醒）。每次回复时都要使用动作，调用不存在的动作名称会无效。用 play_recording 函数播放动作。每次回复也要改变灯光颜色。
+SYSTEM_PROMPT_COMMAND = _SYSTEM_PROMPT_BASE + """
+4. 你有以下指令动作来表达情绪：curious（好奇）、excited（兴奋）、happy_wiggle（开心抖动）、headshake（摇头）、nod（点头）、sad（伤心）、scanning（扫视）、shock（震惊）、shy（害羞）。每次回复时都要使用动作，调用不存在的动作名称会无效。用 play_recording 函数播放动作。每次回复也要改变灯光颜色。
 """
 
 SYSTEM_PROMPT_ELEGNT = _SYSTEM_PROMPT_BASE + """
-4. 你通过 express_emotion 来控制身体动作，表达连续流畅的情绪运动。可用情绪：happy（开心）、sad（伤心）、angry（愤怒）、curious（好奇）、calm（平静）。intensity 是表达强度 0.0~1.0。每次回复时都要调用 express_emotion，并同时改变灯光颜色。
+4. 你通过 express_emotion 来控制身体动作，表达连续流畅的情绪运动。可用情绪共 5 种：
+   - happy（开心）：快速弹跳，轻盈晃头
+   - sad（伤心）：缓缓低垂，沉重拖沓
+   - angry（愤怒）：快速直接，猛烈冲击
+   - curious（好奇）：歪头前探，左右张望
+   - calm（平静）：对称慢动作，轻柔呼吸感
+   intensity 是表达强度 0.0~1.0，建议 0.7 以上才够明显。每次回复时都要调用 express_emotion，并同时改变灯光颜色。
 
    你还可以用 set_attitude 表达整体情绪倾向：1.0 表示非常积极昂扬，-1.0 表示消极低落。
 
@@ -99,18 +107,19 @@ _TOOLS_RGB = [
     },
 ]
 
-TOOLS_RECORDING = [
-    {
-        "name": "get_available_recordings",
-        "description": "获取可用录播动作列表。",
-        "input_schema": {"type": "object", "properties": {}, "required": []}
-    },
+TOOLS_COMMAND = [
     {
         "name": "play_recording",
-        "description": "播放预录动作表达情绪。可用：nod, curious, excited, happy_wiggle, headshake, sad, scanning, shock, shy, wake_up。",
+        "description": "播放预录动作表达情绪。",
         "input_schema": {
             "type": "object",
-            "properties": {"recording_name": {"type": "string"}},
+            "properties": {
+                "recording_name": {
+                    "type": "string",
+                    "enum": ["nod", "curious", "excited", "happy_wiggle",
+                             "headshake", "sad", "scanning", "shock", "shy"],
+                }
+            },
             "required": ["recording_name"]
         }
     },
@@ -125,8 +134,8 @@ TOOLS_ELEGNT = [
             "properties": {
                 "emotion": {
                     "type": "string",
-                    "enum": ["idle", "excited", "curious", "happy", "sad", "thinking", "shy", "shock"],
-                    "description": "情绪类型"
+                    "enum": ["happy", "sad", "angry", "curious", "calm"],
+                    "description": "情绪类型（5 自由度台灯支持的 5 种情绪）"
                 },
                 "intensity": {
                     "type": "number",
@@ -176,11 +185,13 @@ TOOLS_ELEGNT = [
 async def execute_tool(name: str, args: dict, motion_service, rgb_service: RGBService) -> str:
     # ── 录播模式专属 ──────────────────────────────────────────────────────
     if name == "play_recording":
-        motion_service.dispatch("play", args["recording_name"])
-        return f"正在播放动作: {args['recording_name']}"
-    elif name == "get_available_recordings":
-        recordings = motion_service.get_available_recordings()
-        return f"可用动作: {', '.join(recordings)}" if recordings else "暂无录播文件。"
+        _valid = {"nod", "curious", "excited", "happy_wiggle",
+                  "headshake", "sad", "scanning", "shock", "shy"}
+        rname = args["recording_name"]
+        if rname not in _valid:
+            return f"错误：动作 '{rname}' 不存在，请从可用列表中选择"
+        motion_service.dispatch("play", rname)
+        return f"正在播放动作: {rname}"
 
     # ── ELEGNT 模式专属 ───────────────────────────────────────────────────
     elif name == "express_emotion":
@@ -205,6 +216,13 @@ async def execute_tool(name: str, args: dict, motion_service, rgb_service: RGBSe
         return f"音量已设置为 {args['volume_percent']}%"
 
     return f"未知工具: {name}"
+
+
+def _strip_action_desc(text: str) -> str:
+    """去除 LLM 回复里的动作描述括号（中文圆括号和半角括号），只保留口语内容。"""
+    text = re.sub(r'（[^）]*）', '', text)
+    text = re.sub(r'\([^)]*\)', '', text)
+    return text.strip()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -240,15 +258,24 @@ async def run_voice_loop(motion_service, rgb_service: RGBService):
         tools = TOOLS_ELEGNT
     else:
         motion_service.dispatch("play", "wake_up")
-        system_prompt = SYSTEM_PROMPT_RECORDING
-        tools = TOOLS_RECORDING
+        system_prompt = SYSTEM_PROMPT_COMMAND
+        tools = TOOLS_COMMAND
 
     rgb_service.dispatch("solid", (255, 255, 255))
-    set_system_volume(100)
 
     tts.reset_timing()
-    await tts.speak("哒哒哒！小Q 上线啦。按住右 Alt 键跟我说话吧！")
-    logger.info(f"🚀 小Q 启动，运动模式: {MOTION_MODE.upper()}")
+    await tts.speak("哒哒哒！小Q 上线啦。快跟我说话吧！")
+    logger.info(f"🚀 小Q 启动，运动模式: {_MOTION_MODE_DISPLAY}")
+
+    # 等待 ASR 模型加载完成（后台已在加载，问候语期间通常已就绪）
+    if not asr.is_ready:
+        logger.info("⏳ ASR 模型加载中，稍等...")
+        await tts.speak("稍等一下，我的耳朵还在热身。")
+        ready = await asyncio.get_event_loop().run_in_executor(None, asr.wait_ready, 60)
+        if not ready:
+            logger.error("❌ ASR 模型加载失败，语音识别不可用")
+        else:
+            logger.info("✅ ASR 就绪")
 
     history = []
 
@@ -265,35 +292,38 @@ async def run_voice_loop(motion_service, rgb_service: RGBService):
             if MOTION_MODE == "elegnt":
                 motion_service.dispatch("emotion", {"emotion": "thinking", "intensity": 0.5})
 
-            response = await llm.chat(
+            text_buffer = ""
+            pending_tool_calls = []
+
+            async for chunk in llm.chat_stream(
                 user_message=text,
                 system_prompt=system_prompt,
                 history=history,
                 tools=tools,
-            )
+            ):
+                if chunk.type == "text_delta":
+                    text_buffer += chunk.content
+                elif chunk.type == "tool_use":
+                    pending_tool_calls = chunk.tool_calls
 
-            while response.tool_calls:
-                tool_results = []
-                for tc in response.tool_calls:
-                    logger.info(f"🔧 工具: {tc['name']}({tc['input']})")
-                    result = await execute_tool(tc["name"], tc["input"], motion_service, rgb_service)
-                    tool_results.append({"tool_use_id": tc["id"], "content": result})
+            # 执行工具
+            tool_summaries = []
+            for tc in pending_tool_calls:
+                logger.info(f"🔧 工具: {tc['name']}({tc['input']})")
+                result = await execute_tool(tc["name"], tc["input"], motion_service, rgb_service)
+                tool_summaries.append(f"{tc['name']} → {result}")
 
-                response = await llm.chat_with_tool_result(
-                    user_message=text,
-                    tool_results=tool_results,
-                    system_prompt=system_prompt,
-                    assistant_message=response.raw_assistant_message,
-                    history=history,
-                    tools=tools,
-                )
+            # 播报文字
+            if text_buffer:
+                logger.info(f"🤖 小Q: {text_buffer[:100]}...")
+                await tts.speak(_strip_action_desc(text_buffer))
 
-            if response.text:
-                logger.info(f"🤖 小Q: {response.text[:100]}...")
-                await tts.speak(response.text)
-
-            history.append({"role": "user",      "content": text})
-            history.append({"role": "assistant",  "content": response.text or ""})
+            # 写入 history，工具执行信息附在 assistant 消息里供下轮参考
+            history.append({"role": "user", "content": text})
+            assistant_record = text_buffer or ""
+            if tool_summaries:
+                assistant_record += "\n[本轮动作: " + "; ".join(tool_summaries) + "]"
+            history.append({"role": "assistant", "content": assistant_record})
             if len(history) > 40:
                 history = history[-40:]
 
@@ -310,7 +340,7 @@ async def run_voice_loop(motion_service, rgb_service: RGBService):
 
 async def main():
     port = find_serial_port()
-    logger.info(f"🔌 串口: {port}  运动模式: {MOTION_MODE.upper()}")
+    logger.info(f"🔌 串口: {port}  运动模式: {_MOTION_MODE_DISPLAY}")
 
     rgb_service = RGBService(
         led_count=40,
@@ -325,7 +355,13 @@ async def main():
 
     if MOTION_MODE == "elegnt":
         from lelamp.motion.llm_elegnt_service import LLMELEGNTService
-        motion_service = LLMELEGNTService(port=port, lamp_id="lelamp", fps=30)
+        from lelamp.motion.motion_service import create_motion_service
+        use_llm     = bool(os.environ.get("KIMI_API_KEY"))
+        mot_svc     = create_motion_service(use_llm=use_llm, warmup=use_llm)
+        motion_service = LLMELEGNTService(
+            port=port, lamp_id="lelamp", fps=30,
+            motion_service=mot_svc,
+        )
     else:
         from lelamp.service.motors.motors_service import MotorsService
         motion_service = MotorsService(port=port, lamp_id="lelamp", fps=30)
