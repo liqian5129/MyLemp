@@ -15,3 +15,5 @@ wheels/
 
 # debug log
 tmp/*
+logs/
+snapshots/

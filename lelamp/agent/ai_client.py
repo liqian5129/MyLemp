@@ -419,6 +419,82 @@ class AIClient:
                 stop_reason="error"
             )
 
+    async def chat_messages(
+        self,
+        messages: List[Dict],
+        tools: List[Dict] = None,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        """直接用消息列表调用 LLM，用于 ReAct 循环的续轮（调用方自行维护 messages）"""
+        total_start = time.time()
+        try:
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": self._get_temperature(),
+            }
+            extra_body = self._get_extra_body()
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+            if tools:
+                kwargs["tools"] = self._convert_tools(tools)
+                kwargs["tool_choice"] = "auto"
+
+            response = await self.client.chat.completions.create(**kwargs)
+            total_ms = (time.time() - total_start) * 1000
+
+            message = response.choices[0].message
+            text = message.content or ""
+
+            # Kimi thinking 模式：reasoning_content 是思考链
+            reasoning = getattr(message, "reasoning_content", None) or ""
+            if reasoning:
+                logger.info("🧠 Kimi 思考链:\n%s", reasoning)
+
+            tool_calls = []
+            raw_assistant_message = None
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    tool_calls.append({
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "input": json.loads(tc.function.arguments)
+                    })
+                raw_assistant_message = {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in message.tool_calls
+                    ],
+                }
+
+            stop_reason = response.choices[0].finish_reason
+            if tool_calls:
+                stop_reason = "tool_use"
+
+            logger.info("🔄 ReAct 续轮完成: %.0f ms  stop=%s  tools=%d",
+                        total_ms, stop_reason, len(tool_calls))
+            return LLMResponse(
+                text=text,
+                tool_calls=tool_calls,
+                stop_reason=stop_reason,
+                raw_assistant_message=raw_assistant_message,
+            )
+
+        except Exception as e:
+            total_ms = (time.time() - total_start) * 1000
+            logger.error("❌ chat_messages 失败 (%.0f ms): %s", total_ms, e)
+            return LLMResponse(text="", tool_calls=[], stop_reason="error")
+
     async def chat_stream(
         self,
         user_message: str,

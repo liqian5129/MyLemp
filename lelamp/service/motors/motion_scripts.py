@@ -47,20 +47,67 @@ def _hold(pos: dict, duration: float) -> list:
 
 def _build_frames(current: dict, segments: list) -> list:
     """
+    Catmull-Rom 样条：全局平滑，中间路点速度连续，起止点速度=0。
+    消除旧逐段 smoothstep 在段衔接处的顿挫感。
+
     segments: [(partial_target_dict, duration_sec), ...]
-    partial_target_dict 只含要动的关节（相对偏移或绝对值均可），
-    其余关节自动继承上一帧的值。
+    partial_target_dict 只含要动的关节，其余继承上一路点值。
     """
-    frames = []
+    if not segments:
+        return []
+
+    # ── 1. 构建完整路点序列 ────────────────────────────────────────────
+    joints = list(HOME_POS.keys())
+    waypoints  = [dict(current)]
+    timestamps = [0.0]
+    t_acc = 0.0
     prev = dict(current)
     for target_partial, duration in segments:
-        # 合并：不动的关节保持 prev 值
         target_full = dict(prev)
         for k, v in target_partial.items():
-            target_full[k] = _clamp(v)
-        n = max(1, int(duration * FPS))
-        frames += _interp(prev, target_full, n)
+            if k in target_full:
+                target_full[k] = _clamp(v)
+        t_acc += max(1e-3, float(duration))
+        waypoints.append(target_full)
+        timestamps.append(t_acc)
         prev = target_full
+
+    n_wp = len(waypoints)
+
+    # ── 2. 计算各路点切线（Catmull-Rom 变体） ─────────────────────────
+    # 起点/终点：切线=0（ease-in/out），内部路点：跨段中心差分（速度连续）
+    tangents = []
+    for i in range(n_wp):
+        if i == 0 or i == n_wp - 1:
+            tangents.append({k: 0.0 for k in joints})
+        else:
+            dt_span = timestamps[i + 1] - timestamps[i - 1]
+            tangents.append({
+                k: (waypoints[i + 1][k] - waypoints[i - 1][k]) / dt_span
+                for k in joints
+            })
+
+    # ── 3. 逐段生成帧（三次 Hermite） ─────────────────────────────────
+    frames = []
+    for seg in range(n_wp - 1):
+        t0, t1 = timestamps[seg], timestamps[seg + 1]
+        P0, P1 = waypoints[seg],  waypoints[seg + 1]
+        T0, T1 = tangents[seg],   tangents[seg + 1]
+        dt     = t1 - t0
+        n_frames = max(1, int(dt * FPS))
+
+        for i in range(n_frames):
+            s = (i + 1) / n_frames          # 不含起始帧，含末尾帧
+            s2, s3 = s * s, s * s * s
+            h00 =  2*s3 - 3*s2 + 1
+            h10 =    s3 - 2*s2 + s
+            h01 = -2*s3 + 3*s2
+            h11 =    s3 -   s2
+            frames.append({
+                k: max(-100.0, min(100.0, h00*P0[k] + h10*dt*T0[k] + h01*P1[k] + h11*dt*T1[k]))
+                for k in joints
+            })
+
     return frames
 
 
@@ -188,26 +235,9 @@ def shy(pos: dict) -> list:
 
 
 def wake_up(pos: dict) -> list:
-    """唤醒：从低垂慢慢舒展到 HOME，最后左右看一眼"""
-    wp = pos["wrist_pitch"]
+    """唤醒：从当前姿态平滑站起来到 HOME"""
     return _build_frames(pos, [
-        # 先微微低头
-        ({"wrist_pitch": _clamp(wp - 15)},                                      0.8),
-        # 臂、yaw、roll 一起缓缓回到 HOME（慢，避免抖动）
-        ({"base_pitch":  HOME_POS["base_pitch"],
-          "elbow_pitch": HOME_POS["elbow_pitch"],
-          "base_yaw":    HOME_POS["base_yaw"],
-          "wrist_roll":  HOME_POS["wrist_roll"]},                                2.0),
-        # 灯头慢慢昂起到 HOME
-        ({"wrist_pitch": HOME_POS["wrist_pitch"]},                               1.2),
-        # 停顿，站稳了
-        ({},                                                                      0.5),
-        # 左看
-        ({"base_yaw": _clamp(HOME_POS["base_yaw"] - 20)},                       0.7),
-        # 右看
-        ({"base_yaw": _clamp(HOME_POS["base_yaw"] + 20)},                       0.7),
-        # 回正
-        ({"base_yaw": HOME_POS["base_yaw"]},                                     0.7),
+        ({k: HOME_POS[k] for k in HOME_POS}, 2.5),
     ])
 
 

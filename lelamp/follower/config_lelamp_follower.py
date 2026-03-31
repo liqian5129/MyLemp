@@ -33,7 +33,7 @@ class LeLampFollowerConfig(RobotConfig):
     # Set this to a positive scalar to have the same value for all motors, or a list that is the same length as
     # the number of motors in your follower arms.
     # 1 unit per frame at 30fps = max ~30 deg/sec in -100~100 normalized space (~1 unit ≈ 1 deg).
-    max_relative_target: float | None = 100.0
+    max_relative_target: float | None = None
 
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)

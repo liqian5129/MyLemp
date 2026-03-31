@@ -76,11 +76,21 @@ class FunasrASR:
         t0 = time.time()
         try:
             from funasr import AutoModel
+
+            # 优先用本地缓存路径，完全跳过 ModelScope Hub 网络检查
+            # 避免网络抖动导致加载时间从 6s 飙到 26s+
+            _cache = os.path.expanduser(
+                "~/.cache/modelscope/hub/models/iic/"
+                "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
+            )
+            model_src = _cache if os.path.isdir(_cache) else self._model_name
+            if model_src != self._model_name:
+                logger.info("📦 使用本地缓存: %s", model_src)
+
             self._model = AutoModel(
-                model=self._model_name,
+                model=model_src,
                 device=self._device_str,
                 disable_update=True,
-                punc_model="ct-punc",
             )
             self._model_loaded = True
             elapsed = time.time() - t0

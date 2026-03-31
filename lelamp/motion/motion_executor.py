@@ -8,9 +8,13 @@
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # ── 硬件常量 ──────────────────────────────────────────────────────────────────
 
@@ -21,7 +25,7 @@ JOINT_NAMES = ["base_yaw", "base_pitch", "elbow_pitch", "wrist_roll", "wrist_pit
 
 Q_MIN = np.array([ -5.0, -68.0,  50.0, -30.0,  -5.0], dtype=np.float32)
 Q_MAX = np.array([ 14.0, -20.0, 100.0,  15.0,  68.0], dtype=np.float32)
-Q_REST = np.array([  0.0, -44.0,  75.0,   0.0,  25.0], dtype=np.float32)
+Q_REST = np.array([  0.0, -44.0,  77.0,   0.0,  25.0], dtype=np.float32)  # elbow 实测静止值约 77°
 
 # 各关节最大速度 (deg/s)
 DQ_MAX = np.array([60.0, 80.0, 80.0, 60.0, 80.0], dtype=np.float32)
@@ -161,7 +165,14 @@ def assemble_trajectory(
     ], axis=0)  # (4, N_JOINTS)
 
     # 相邻帧约束
+    q_before = q_raw.copy()
     q_raw = clamp_frame_deltas(q_raw)
+    if not np.allclose(q_before, q_raw, atol=0.1):
+        logger.info(
+            "⚙️  帧间裁剪  f1_delta=%s  f2_delta=%s",
+            np.round(q_raw[1] - q_before[1], 1).tolist(),
+            np.round(q_raw[2] - q_before[2], 1).tolist(),
+        )
 
     # 插值
     t_traj, q_traj = interpolate(q_raw, duration, accel_ratio, asymmetry, dt)
@@ -169,8 +180,25 @@ def assemble_trajectory(
     # 速度安全拉伸
     t_traj, q_traj = velocity_safe_stretch(t_traj, q_traj)
 
+    # 速度拉伸警告
+    final_dur = float(t_traj[-1])
+    if final_dur > duration * 1.05:
+        logger.info(
+            "⚙️  速度拉伸  %.2fs → %.2fs (×%.2f)",
+            duration, final_dur, final_dur / duration,
+        )
+
     # 位置限位
     q_traj = np.clip(q_traj, Q_MIN, Q_MAX)
+
+    # 轨迹采样（25% / 50% / 75% 三个中间点）
+    n = len(t_traj)
+    for pct, idx in [(25, n // 4), (50, n // 2), (75, 3 * n // 4)]:
+        q = q_traj[idx]
+        logger.debug(
+            "   t=%d%%  yaw=%.1f pitch=%.1f elbow=%.1f roll=%.1f wrist=%.1f",
+            pct, q[0], q[1], q[2], q[3], q[4],
+        )
 
     return t_traj, q_traj
 
