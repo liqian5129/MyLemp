@@ -237,7 +237,7 @@ def shy(pos: dict) -> list:
 def wake_up(pos: dict) -> list:
     """唤醒：从当前姿态平滑站起来到 HOME"""
     return _build_frames(pos, [
-        ({k: HOME_POS[k] for k in HOME_POS}, 2.5),
+        ({k: HOME_POS[k] for k in HOME_POS}, 2.0),
     ])
 
 

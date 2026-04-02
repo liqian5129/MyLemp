@@ -103,13 +103,15 @@ async def main():
 
     # ── 记忆 + 智能体 ─────────────────────────────────────────────────────────
     mem   = MemoryStream()
+    mem.start()   # 启动后台防抖写盘
     agent = SoulAgent(motion_svc, rgb_svc, tts, mem, llm)
 
-    # ── ASR（后台加载模型）────────────────────────────────────────────────────
-    loop = asyncio.get_running_loop()
-    asr  = create_local_asr()   # 立即开始后台加载
+    # ── 开机动作：wake_up 在最轻负载下执行（ASR/摄像头均未启动）────────────────
+    motion_svc.play_emotion("wake_up")
+    rgb_svc.dispatch("solid", (180, 180, 255))
+    await asyncio.sleep(2.2)   # 等 wake_up（2.0s）执行完毕
 
-    # ── 摄像头感知 ────────────────────────────────────────────────────────────
+    # ── 摄像头感知（wake_up 结束后再启动）────────────────────────────────────
     camera_device = int(os.environ.get("CAMERA_DEVICE", "0"))
     camera_flip = os.environ.get("CAMERA_FLIP", "").lower() in ("1", "true", "yes")
     camera = CameraCapture(
@@ -119,9 +121,9 @@ async def main():
     camera.start()
     agent.set_camera(camera)
 
-    # ── 开机动作：wake_up 动作与 ASR 加载并行，加载完再开口 ──────────────────
-    motion_svc.play_emotion("wake_up")
-    rgb_svc.dispatch("solid", (180, 180, 255))
+    # ── ASR（wake_up 结束后再启动后台加载，避免模型加载与运动争抢 CPU）─────────
+    loop = asyncio.get_running_loop()
+    asr  = create_local_asr()
     await asyncio.to_thread(asr.wait_ready)   # 等 ASR 加载完成（后台线程，不阻塞循环）
     await tts.speak("呼——我醒来了。")
     mem.add("felt", "刚刚启动，世界感觉是新鲜的", importance=6)

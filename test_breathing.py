@@ -41,12 +41,7 @@ def main():
     agent.play_waypoint(HOME_POS, duration=2.0)
     time.sleep(2.5)  # 等动作完成
 
-    # 直接解除 hold，让呼吸立即生效
-    import time as _t
-    with agent._lock:
-        agent._idle_hold_until = 0.0
-        agent._idle_base = dict(HOME_POS)
-    logger.info("💨 呼吸开始，Ctrl-C 退出")
+    logger.info("✅ HOME_POS 到位，Ctrl-C 退出")
 
     stop = False
     def _on_signal(*_):

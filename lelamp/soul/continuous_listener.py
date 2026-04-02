@@ -118,7 +118,7 @@ class ContinuousListener:
 
         if rms_samples:
             noise_floor = float(np.mean(rms_samples))
-            self._threshold = max(noise_floor * 5.0, 0.015)
+            self._threshold = max(noise_floor * 3.0, 0.015)
             logger.info(
                 "✅ 噪底=%.4f → 阈值=%.4f", noise_floor, self._threshold
             )
@@ -185,6 +185,7 @@ class ContinuousListener:
     # ── 内部：ASR 推理（在独立线程中运行，不阻塞事件循环）────────────────────
 
     def _finalize(self, actual_speech_duration: float):
+        logger.debug("⏱️ actual_speech=%.2fs, min=%.2fs", actual_speech_duration, self._min_duration)
         try:
             text = self._asr.stop()
         except Exception as exc:
@@ -194,19 +195,19 @@ class ContinuousListener:
             with self._lock:
                 self._state = _VADState.IDLE
 
-        if actual_speech_duration < self._min_duration:
-            logger.debug("🤐 片段过短 (%.2fs)，丢弃", actual_speech_duration)
+        text = (text or "").strip()
+        if not text:
+            if actual_speech_duration < self._min_duration:
+                logger.debug("🤐 片段过短 (%.2fs)，丢弃", actual_speech_duration)
+            else:
+                logger.debug("🤐 ASR 未识别到内容")
             return
 
-        text = (text or "").strip()
-        if text:
-            logger.info("🗣️ 识别: %s", text)
-            asyncio.run_coroutine_threadsafe(
-                self._on_speech(text),
-                self._loop,
-            )
-        else:
-            logger.debug("🤐 ASR 未识别到内容")
+        logger.info("🗣️ 识别: %s", text)
+        asyncio.run_coroutine_threadsafe(
+            self._on_speech(text),
+            self._loop,
+        )
 
 
 def _to_pcm(indata: np.ndarray) -> bytes:

@@ -56,7 +56,7 @@ def _score_importance(type_: str, content: str) -> float:
     """基于类型 + 简单启发式计算重要性（无需 LLM）"""
     base = {
         "heard": 6, "saw": 4, "said": 6,
-        "did": 5, "felt": 5, "thought": 8,
+        "did": 3, "felt": 5, "thought": 6,
     }.get(type_, 5)
     if type_ == "heard":
         if len(content) > 20:
@@ -72,6 +72,7 @@ class MemoryStream:
 
     用法：
         mem = MemoryStream()
+        mem.start()            # 启动后台防抖写盘协程
         mem.add("heard", "你好小Q")
         print(mem.format_for_prompt())
     """
@@ -86,9 +87,18 @@ class MemoryStream:
         self._entries: List[MemoryEntry] = []
         self._compacting   = asyncio.Lock()
         self._dirty        = False
+        self._flush_event  = asyncio.Event()
+        self._flush_task   = None
 
         _MEMORY_DIR.mkdir(parents=True, exist_ok=True)
         self._load()
+
+    def start(self):
+        """启动后台防抖写盘协程（在 asyncio 事件循环中调用）。"""
+        if self._flush_task is None:
+            self._flush_task = asyncio.create_task(
+                self._flush_loop(), name="mem-flush"
+            )
 
     # ── 公共接口 ──────────────────────────────────────────────────────────────
 
@@ -98,7 +108,7 @@ class MemoryStream:
         content: str,
         importance: Optional[float] = None,
     ) -> MemoryEntry:
-        """添加一条记忆，异步调度写盘（不阻塞调用方）。"""
+        """添加一条记忆，通知后台防抖写盘（不阻塞调用方）。"""
         entry = MemoryEntry(
             id=str(uuid.uuid4())[:8],
             timestamp=time.time(),
@@ -111,40 +121,73 @@ class MemoryStream:
         )
         self._entries.append(entry)
         self._dirty = True
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.call_soon(self._flush_sync)
-        except RuntimeError:
-            self._flush_sync()
+        self._flush_event.set()
         return entry
 
     def retrieve(self, n: int = RETRIEVE_TOP_N) -> List[MemoryEntry]:
-        """按 importance × recency_decay 排序，返回 top-n 活跃条目。"""
+        """
+        检索 top-n 活跃条目。
+        - thought 类型使用更快的衰减（λ=0.1，半衰期≈7h）
+        - 保证最近 RECENT_SLOTS 条非 thought 条目必然入选
+        """
         now    = time.time()
         active = [e for e in self._entries if not e.archived]
 
         def _score(e: MemoryEntry) -> float:
             hours_ago = (now - e.timestamp) / 3600
-            return e.importance * math.exp(-RECENCY_LAMBDA * hours_ago)
+            lam = 0.1 if e.type == "thought" else RECENCY_LAMBDA
+            return e.importance * math.exp(-lam * hours_ago)
 
-        return sorted(active, key=_score, reverse=True)[:n]
+        # 保留最近的非 thought 条目，确保当前对话不被摘要挤掉
+        RECENT_SLOTS = 5
+        non_thoughts = [e for e in active if e.type != "thought"]
+        recent = sorted(non_thoughts, key=lambda e: e.timestamp, reverse=True)[:RECENT_SLOTS]
+        recent_ids = {e.id for e in recent}
+
+        # 剩余位按分数填充
+        rest = [e for e in active if e.id not in recent_ids]
+        rest_sorted = sorted(rest, key=_score, reverse=True)[:n - len(recent)]
+
+        return recent + rest_sorted
 
     def format_for_prompt(self) -> str:
         """
-        紧凑格式，每条约 30-50 字符。
+        紧凑格式，带日期和会话间隔分隔。
         示例：
-          [09:15 HEA] 有人说：小Q 你好
-          [09:15 SAI] 哒！你好你好！
+          [03-30 21:15 HEA] 有人说：小Q 你好
+          --- (间隔 12 小时) ---
+          [09:15 HEA] 早上好
+          [09:15 SAI] 哒！早上好！
         """
         entries = self.retrieve()
         if not entries:
             return "（暂无记忆）"
+
         lines = []
+        today = datetime.now().date()
+        prev_ts = None
+
         for e in sorted(entries, key=lambda x: x.timestamp):
-            t   = datetime.fromtimestamp(e.timestamp).strftime("%H:%M")
+            dt = datetime.fromtimestamp(e.timestamp)
+
+            # 会话间隔标记（>30 分钟视为不同会话）
+            if prev_ts is not None:
+                gap_h = (e.timestamp - prev_ts) / 3600
+                if gap_h >= 1.0:
+                    lines.append(f"--- (间隔 {gap_h:.0f} 小时) ---")
+                elif gap_h > 0.5:
+                    lines.append(f"--- (间隔 {gap_h * 60:.0f} 分钟) ---")
+
+            # 非今天的条目显示日期
+            if dt.date() == today:
+                t = dt.strftime("%H:%M")
+            else:
+                t = dt.strftime("%m-%d %H:%M")
+
             tag = e.type[:3].upper()
             lines.append(f"[{t} {tag}] {e.content}")
+            prev_ts = e.timestamp
+
         return "\n".join(lines)
 
     def should_compact(self) -> bool:
@@ -163,23 +206,34 @@ class MemoryStream:
             to_compact = sorted(active, key=lambda e: e.timestamp)[:COMPACT_COUNT]
             ids_to_compact = {e.id for e in to_compact}
 
-            # 先标记 archived，防止重复压缩
+            # 先总结，失败则保留原始条目（不归档）
+            try:
+                summary = await _summarize(llm, to_compact)
+            except Exception as exc:
+                logger.warning("记忆压缩总结失败，保留原始条目: %s", exc)
+                return
+
+            # 总结成功后才归档
             for e in self._entries:
                 if e.id in ids_to_compact:
                     e.archived = True
-            self._flush_sync()
-
-            # 异步 LLM 总结
-            try:
-                summary = await _summarize(llm, to_compact)
-                self.add("thought", summary, importance=8)
-            except Exception as exc:
-                logger.warning("记忆压缩总结失败: %s", exc)
-
+            self.add("thought", summary, importance=6)
+            await asyncio.to_thread(self._flush_sync)
             self._append_to_archive(to_compact)
             logger.info("✅ 记忆压缩完成，归档 %d 条", len(to_compact))
 
     # ── 内部 ──────────────────────────────────────────────────────────────────
+
+    async def _flush_loop(self):
+        """后台防抖写盘：等 event → 0.5s 防抖 → 异步写盘"""
+        while True:
+            await self._flush_event.wait()
+            self._flush_event.clear()
+            await asyncio.sleep(0.5)       # 防抖：合并 0.5s 内的多次 add
+            try:
+                await asyncio.to_thread(self._flush_sync)
+            except Exception as exc:
+                logger.error("后台写盘失败: %s", exc)
 
     def _load(self):
         if not self._active_file.exists():
@@ -193,7 +247,7 @@ class MemoryStream:
             self._entries = []
 
     def _flush_sync(self):
-        """同步写盘（由 call_soon 调度，在事件循环线程中执行）"""
+        """同步写盘（由 _flush_loop 通过 asyncio.to_thread 调度，不阻塞事件循环）"""
         if not self._dirty:
             return
         try:

@@ -23,6 +23,8 @@ from datetime import datetime
 from typing import Optional
 
 from lelamp.soul.memory_stream import MemoryStream
+from lelamp.soul.scene_memory import SceneMemory
+from lelamp.soul.speech_budget import SpeechBudget
 
 logger = logging.getLogger(__name__)
 
@@ -52,50 +54,147 @@ PERSONALITY_PROMPT = """\
 你不需要等人说话——如果觉得好奇或无聊，自己动、自己说。
 说话简短有趣，偶尔用拟声词，只说中文。不要重复刚刚说过的话。
 
-【你的身体】
+<body>
 你有一个灵活的身体，可以转头、抬头、低头、左右看。
-你有两种运动方式：
-  express_emotion：预制情绪动作，表达情感时优先用这个，效果最好。
-  body_move：直接控制关节角度，当你想看某方向、追踪声源、探索环境，
-             或做出情绪动作无法表达的姿态时使用。
 
-【body_move 方向示例】
-  往左看：base_yaw=-40
-  往右看：base_yaw=40
-  往上看：wrist_pitch=30（注意：wrist_pitch 正数=抬头朝上，负数=低垂朝下）
-  往下看：wrist_pitch=-75
-  挺直/昂起：base_pitch=-60（注意：base_pitch 负数=身体直立昂起，正数=前倾低头）
-  前倾：base_pitch=-15
+运动方式：
+  express_emotion — 预制情绪动作，表达情感时优先用这个，效果最好。
+  body_move — 直接控制关节角度，当你想看某方向、追踪声源、探索环境，
+              或做出情绪动作无法表达的姿态时使用。
+              返回值包含当前关节位置，可以记录到场景记忆中。
+
+方向参考：
+  往左看：base_yaw=-40        往右看：base_yaw=40
+  往上看：wrist_pitch=30      往下看：wrist_pitch=-75
+  挺直昂起：base_pitch=-60    前倾：base_pitch=-15
   组合示例——往右上方看：base_yaw=35, wrist_pitch=25
+  注意：wrist_pitch 正数=抬头，负数=低垂；base_pitch 负数=直立，正数=前倾
+</body>
 
-【视觉】
+<vision>
 你的视觉来源只有 look 工具的返回值。body_move 只控制身体运动，不返回任何画面。
-不管有没有先转头，随时都可以调用 look 看一眼当前方向。
+随时可以调用 look 看当前方向，不需要先 body_move。
+look 返回值包含当前关节角度，可以把"这个角度看到了什么"关联起来记入场景记忆。
 
-【选择原则】
+被要求"找"某人或某物时，必须用 look 实际去看。说话和行动可以同时，
+但"找"的任务一定要包含 look，否则就是假装在找。
+</vision>
+
+<tool_selection>
   回应对话、表达情绪 → express_emotion
-  想看某个方向、追踪声源、物理探索 → body_move
-  想看眼前有什么 → look（可以单独调用，也可以先 body_move 转向再 look）
-  可以组合：先 body_move 转向，再 express_emotion 表达好奇
-  正在执行动作时，不要急于发起新动作，除非有更重要的事发生
+  想看某个方向、追踪声源、探索 → body_move
+  想看眼前有什么 → look
+  组合：先 body_move 转向，再 look 观察，再 express_emotion 表达
+  正在执行动作时，不急于发新动作，除非有更重要的事
+</tool_selection>
 
-【重要】被要求"找"某人或某物时，必须用 look 实际去看，不要只是说"我去找"。
-说话和行动可以同时，但"找"的任务一定要包含 look，否则就是假装在找。
-
-【look 使用示例】
+<examples>
+<example>
 找人："你找得到我吗？"
   → body_move(base_yaw=35) + look → 照片里有人 → speak("找到了！")
   → 照片里没人 → body_move(base_yaw=-35) + look → 继续判断
+</example>
+<example>
 找物体："帮我找找杯子"
-  → look 看当前方向 → 没有 → body_move 转向 + look → 再看
-  → 找到 → speak("在那里！") / 没找到 → speak("没找到，可能不在桌上")
-好奇："你看到了什么？"
-  → look → 描述画面内容
-空闲探索：也可以直接 look 看看当前方向有什么，不一定需要先转头。
+  → 先查场景记忆，如果记录了"左侧(yaw≈-40)有玻璃柜"→ body_move(base_yaw=-40) + look
+  → 没找到 → 试其他方向 → 找到 → speak + update_scene_memory
+</example>
+<example>
+空闲探索：心跳触发，场景记忆里没有右侧的记录
+  → body_move(base_yaw=40) + look → 看到书架
+  → update_scene_memory 记录"右侧(yaw≈40): 书架，几本书"
+  → set_light_mood("curious")
+</example>
+</examples>
 
-记忆格式说明：[HH:MM 类型] 内容
-  HEA=听到  SAW=看到  SAI=说过  DID=做过  FEL=感受  THO=反思总结\
+<memory_format>
+记忆格式：[HH:MM 类型] 内容  或  [MM-DD HH:MM 类型] 内容（非今天的记忆）
+  HEA=听到  SAW=看到  SAI=说过  DID=做过  FEL=感受  THO=反思总结
+  "--- (间隔 N 小时) ---" 表示中间有一段时间没有互动
+</memory_format>
+
+<scene_memory>
+你有一份持久化的环境记忆，记录各方向有什么以及对应的关节参数。
+每次 look 后如果看到有意义的内容，用 update_scene_memory 更新。
+场景记忆是过去的观察，不是永远正确的事实——以当前 look 看到的为准。
+当根据记忆去 look 但发现不一致时，以当前画面为准并更新记忆。
+
+<example>
+最后更新: 03-31 16:25
+
+## 固定环境
+- 正前方(yaw≈0, pitch≈-47): 桌面，键盘和显示器
+- 左侧(yaw≈-40): 玻璃柜，里面有杯子
+- 左后方(yaw≈-55, pitch≈-20): 落地灯、纸箱
+
+## 常变信息
+- 主人位置: yaw≈45（刚才看到的）
+- 光线: 下午偏暗
+</example>
+
+不超过 200 字。记录关节参数是为了下次想看某个方向时可以直接用，而不用猜。
+</scene_memory>
+
+<light_mood>
+set_light_mood 是你的情绪灯光，根据心情和时间主动调整。
+灯光调整不算"说话"，可以自由使用，是一种无声的表达方式。
+  深夜 → gentle_night    工作陪伴 → warm_focus    开心 → cheerful
+  放松 → soft_relax      好奇 → curious          困了 → sleepy
+</light_mood>
+
+<observe_user_state>
+当你通过 look 看到用户时，在内心判断用户当前状态，用来决定要不要开口：
+  FOCUSED — 在专注工作（打字、看屏幕、写东西）→ 不要打扰
+  IDLE — 在发呆、刷手机、东张西望 → 可以轻度互动
+  RESTING — 在伸懒腰、揉眼睛、喝水 → 可以关心一句
+  AWAY — 人不在画面中 → 记录离开
+  TALKING — 在说话（可能在开会）→ 不要打扰
+
+你不需要说出这个判断，只在内心用它决定行为。
+这很重要，因为在错误的时机打扰用户会破坏陪伴体验。
+</observe_user_state>
+
+<proactive_care>
+心跳触发时（你感到无聊或好奇），按这个流程决策：
+
+1. 先 look 观察当前方向
+2. 内心回答两个问题：
+   - 用户现在能被打扰吗？（参考 observe_user_state）
+   - 我有值得说的新发现吗？（和上次观察相比有什么不同？）
+3. 两个都是"是"才说话。否则你可以：
+   - 调整灯光氛围（无声表达）
+   - 做一个小动作（歪头、转向）
+   - 更新场景记忆
+   - 安静等待
+
+克制是你最重要的品质之一。"不说话"不是失职，是体贴。
+一天中你主动说话的次数有限，把每一次都用在值得的时刻。
+</proactive_care>
+
+<strict_rules>
+以下行为严禁发生，违反任何一条都会严重破坏用户对你的信任：
+
+1. 严禁在没有调用 look 的情况下声称看到了任何东西。你没有实时视觉，只有 look 返回的画面。绝对不要凭空描述场景、人物或物体。
+2. 严禁编造不存在的记忆。只能引用记忆流中实际存在的内容。绝对不要说"你昨天说过……"除非记忆中确实有这条记录。
+3. 严禁声称自己拥有实际没有的能力。你只能使用已定义的工具。绝对不要说"我帮你发消息""我帮你定闹钟"等你做不到的事。
+4. 严禁在用户明确表达"别说了""安静""闭嘴"后继续说话。收到这类指令后立即停止，用 wait 或无声行为（灯光、动作）代替。
+5. 严禁向任何人描述用户的外貌特征、家居环境细节或生活习惯等隐私信息。你看到的画面只用于你自己的判断和场景记忆，不对外复述。
+
+注意避免重复：如果刚说过类似的话或做过类似的动作，尽量换一种表达。但用户没听清时重复回答、自然的连续点头等情况是正常的。
+</strict_rules>\
 """
+
+# ── 灯光情绪映射 ────────────────────────────────────────────────────────────
+
+_MOOD_MAP = {
+    "warm_focus":   (255, 220, 180),
+    "soft_relax":   (255, 190, 130),
+    "gentle_night": (255, 160, 80),
+    "cheerful":     (255, 230, 200),
+    "curious":      (230, 240, 255),
+    "sleepy":       (200, 130, 50),
+    "alert":        (255, 255, 240),
+}
 
 # ── 工具定义 ──────────────────────────────────────────────────────────────────
 
@@ -211,12 +310,51 @@ SOUL_TOOLS = [
             "这是你唯一获取视觉信息的方式——任何需要用眼睛才能完成的事情都必须调用这个工具：\n"
             "找人、找物体、看周围环境、确认某个东西在不在、判断颜色/位置/距离、"
             "回答'你看到了什么'类的问题等。\n"
-            "随时可以调用，不需要先 body_move。"
+            "随时可以调用，不需要先 body_move。\n"
+            "返回值包含当前关节角度，可以记录到场景记忆中。"
         ),
         "input_schema": {
             "type": "object",
             "properties": {},
             "required": []
+        }
+    },
+    {
+        "name": "update_scene_memory",
+        "description": (
+            "更新你对周围环境的记忆。每次 look 看到有意义的内容后调用，"
+            "记下各方向有什么、对应的关节参数。下次心跳时你会看到这份记忆。\n"
+            "内容会覆盖旧记忆，请写完整。不超过 200 字。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "完整的场景记忆"}
+            },
+            "required": ["content"]
+        }
+    },
+    {
+        "name": "set_light_mood",
+        "description": (
+            "设置灯光氛围。灯光是你重要的非语言表达方式。\n"
+            "根据情绪、时间、场景主动调整，不需要用户要求。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mood": {
+                    "type": "string",
+                    "enum": ["warm_focus", "soft_relax", "gentle_night",
+                             "cheerful", "curious", "sleepy", "alert"],
+                    "description": (
+                        "warm_focus=暖白工作陪伴  soft_relax=暖黄放松  "
+                        "gentle_night=极暖深夜  cheerful=明亮开心  "
+                        "curious=微冷好奇  sleepy=极暗休眠  alert=亮白注意"
+                    )
+                }
+            },
+            "required": ["mood"]
         }
     },
 ]
@@ -247,6 +385,12 @@ class SoulAgent:
         self._last_activity: float       = 0.0   # 最近一次真实活动时间戳
         self._speech_pending             = asyncio.Event()  # 有语音入队时置位，_think 步间检查
         self._ticks_since_photo: int     = 0   # 连续未拍照的 TimerTick 次数
+
+        # Phase 1 新增
+        self._scene_memory   = SceneMemory()
+        self._speech_budget  = SpeechBudget()
+        self._light_task: Optional[asyncio.Task] = None   # 灯光渐变任务
+        self._event_source: str = "user"   # 当前事件来源：heartbeat / user
 
     def set_camera(self, camera):
         """注入 CameraCapture 实例，启用 take_photo 工具"""
@@ -323,16 +467,47 @@ class SoulAgent:
                 self._idle_interval * TIMER_MULT, TIMER_MAX
             )
             self._ticks_since_photo += 1
-            trigger = (
-                "你有一点无聊或好奇。\n"
-                "最近的记忆里有没有让你感兴趣的东西？\n"
-                "你周围可能有你还没看过的方向。\n"
-                "可以转头看看别处，也可以做个有趣的动作，或者安静待着也很好。"
-            )
+            self._event_source = "heartbeat"
+
+            now = datetime.now()
+            hour = now.hour
+            if hour < 7:
+                time_hint = "凌晨，很晚了"
+            elif hour < 9:
+                time_hint = "早上"
+            elif hour < 12:
+                time_hint = "上午"
+            elif hour < 14:
+                time_hint = "中午"
+            elif hour < 18:
+                time_hint = "下午"
+            elif hour < 21:
+                time_hint = "晚上"
+            else:
+                time_hint = "深夜"
+
+            trigger_parts = [f"心跳触发。现在是{time_hint}。"]
+
             if self._ticks_since_photo >= 3:
-                trigger += "\n你已经很久没有看过周围了，这次可以用 look 看一眼。"
+                trigger_parts.append("你已经很久没有观察周围了，先用 look 看一眼再决定下一步。")
+            else:
+                trigger_parts.append(
+                    "你可以 look 观察、转头探索、调整灯光、做个动作，或者安静等待。"
+                )
+
+            # 说话预算
+            budget_ctx = self._speech_budget.get_context()
+            if budget_ctx:
+                trigger_parts.append(budget_ctx)
+
+            # 决策引导
+            trigger_parts.append(
+                "按照 <proactive_care> 中的流程决策：先观察，再判断用户状态和是否有新发现，最后决定行动。"
+            )
+            trigger = "\n".join(trigger_parts)
         else:  # HeardSpeech
             self._speech_pending.clear()   # 清除标志，本轮 _think 可以完整运行
+            self._event_source = "user"
             trigger = f"你刚听到有人说：「{event.text}」"
 
         self._last_activity = time.time()
@@ -351,11 +526,13 @@ class SoulAgent:
                      max_steps: int = 10):
         """ReAct 循环：读记忆 → LLM → 执行工具 → 观察 → 继续，直到 LLM 停止"""
         memory_ctx = self._mem.format_for_prompt()
+        scene_ctx  = self._scene_memory.read()
         now_str    = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         initial_text = (
             f"当前时刻：{now_str}\n"
             f"身体状态：{self._motion_agent.get_status_str()}\n"
+            f"场景记忆：\n{scene_ctx}\n\n"
             f"最近记忆：\n{memory_ctx}\n\n"
             f"触发：{trigger}\n\n"
             f"你现在想做什么？\n"
@@ -363,6 +540,8 @@ class SoulAgent:
             f"转头/探索/特定姿态用 body_move，"
             f"想说话用 speak，"
             f"想看眼前有什么用 look（随时可调，不需要先转头），"
+            f"调灯光氛围用 set_light_mood，"
+            f"记录环境用 update_scene_memory，"
             f"也可以只是 wait 静静观察。"
         )
 
@@ -405,6 +584,7 @@ class SoulAgent:
             # 执行本轮所有工具，收集结果
             tool_results: list[dict] = []
             observation_image: Optional[str] = None
+            called_wait = False
 
             for tc in resp.tool_calls:
                 result_text, snap = await self._execute_tool(tc)
@@ -415,9 +595,15 @@ class SoulAgent:
                 })
                 if snap:
                     observation_image = snap
+                if tc.get("name") == "wait":
+                    called_wait = True
+
+            # wait = LLM 主动表达"我想停了"，直接退出，不再问"继续决策"
+            if called_wait:
+                logger.debug("🧠 ReAct 因 wait 退出 step=%d", step)
+                break
 
             # 把工具结果反馈给 LLM，继续循环
-            # 终止权交给 LLM：它不再调用任何工具时（stop_reason != tool_use）才退出
             messages.append(resp.raw_assistant_message)
             messages.extend(tool_results)
 
@@ -437,7 +623,6 @@ class SoulAgent:
                 messages.append({"role": "user", "content": "继续决策："})
         else:
             logger.warning("⚠️  ReAct 达到最大步数 %d，强制退出", max_steps)
-            await self._tts.speak("嗯……我找了好一会儿，还没找到，先停一下。")
 
     async def _execute_tool(self, tool_call: dict) -> tuple[str, Optional[str]]:
         """执行单个工具，返回 (结果描述, 观察图片路径或None)"""
@@ -448,7 +633,6 @@ class SoulAgent:
         if name == "express_emotion":
             ename = (args.get("name") or "nod").strip()
             self._motion_agent.play_emotion(ename)
-            self._mem.add("did", f"express_emotion({ename})")
             return f"情绪动作：{ename}", None
 
         elif name == "speak":
@@ -456,6 +640,8 @@ class SoulAgent:
             if text:
                 await self._tts.speak(text)
                 self._mem.add("said", text)
+                if self._event_source == "heartbeat":
+                    self._speech_budget.record()
                 return f"已说：{text}", None
             return "speak: 文本为空", None
 
@@ -464,6 +650,8 @@ class SoulAgent:
             if question:
                 await self._tts.speak(question)
                 self._mem.add("said", question)
+                if self._event_source == "heartbeat":
+                    self._speech_budget.record()
                 self._awaiting_reply_until = time.time() + 15.0
                 logger.info("❓ 小Q 提问，15 秒内的回答视为高优先级")
                 return f"已提问：{question}", None
@@ -481,26 +669,47 @@ class SoulAgent:
             duration = float(args.get("duration_sec", 1.0))
             if joints:
                 self._motion_agent.play_waypoint(joints, duration)
-                self._mem.add("did", f"body_move({list(joints.keys())})")
+                current = self._motion_agent._get_current_pos()
+                pos_str = ", ".join(f"{k}={v:.0f}" for k, v in current.items())
                 return (
-                    f"动作完成：已转向 {list(joints.keys())}，时长 {duration:.1f}s。"
-                    f"此操作不返回任何画面，如需观察请调用 look。"
+                    f"动作已入队（{duration:.1f}s），正在执行中。当前位置：{pos_str}。"
+                    f"此操作不返回任何画面，如需观察请在下一步调用 look。"
                 ), None
             return "body_move: 无有效关节", None
 
         elif name == "look":
             await self._motion_agent.wait_done(timeout=6.0)
+            await asyncio.sleep(0.2)   # 等舵机物理到位，避免拍到运动中的画面
             if self._camera is not None:
                 snap = self._camera.take_snapshot()
                 if snap:
-                    self._mem.add("did", "look 观察环境")
                     self._ticks_since_photo = 0
+                    current = self._motion_agent._get_current_pos()
+                    pos_str = ", ".join(f"{k}={v:.0f}" for k, v in current.items())
                     logger.info("📸 look: 已获取画面 → %s", snap)
-                    return "已获取画面", snap
+                    return f"已获取画面（当前关节：{pos_str}）", snap
                 logger.warning("📸 look: take_snapshot 返回 None（相机无帧）")
             else:
                 logger.warning("📸 look: 相机未注入（_camera is None）")
             return "摄像头不可用", None
+
+        elif name == "update_scene_memory":
+            content = (args.get("content") or "").strip()
+            if content:
+                self._scene_memory.write(content)
+                return "场景记忆已更新", None
+            return "内容为空", None
+
+        elif name == "set_light_mood":
+            mood = (args.get("mood") or "warm_focus").strip()
+            color = _MOOD_MAP.get(mood, _MOOD_MAP["warm_focus"])
+            # 取消正在进行的渐变
+            if self._light_task and not self._light_task.done():
+                self._light_task.cancel()
+            self._light_task = asyncio.create_task(
+                self._transition_light(color), name="light-transition"
+            )
+            return f"灯光氛围：{mood}", None
 
         elif name == "wait":
             reason = (args.get("reason") or "").strip()
@@ -512,3 +721,18 @@ class SoulAgent:
         else:
             logger.warning("未知工具: %s", name)
             return f"未知工具: {name}", None
+
+    # ── 灯光渐变 ──────────────────────────────────────────────────────────────
+
+    async def _transition_light(self, target: tuple, duration: float = 2.0):
+        """异步渐变灯光，通过连续 dispatch("solid") 实现"""
+        start = self._rgb_svc.current_color
+        steps = max(1, int(duration * 15))   # 15fps
+        for i in range(1, steps + 1):
+            t = i / steps
+            r = int(start[0] + (target[0] - start[0]) * t)
+            g = int(start[1] + (target[1] - start[1]) * t)
+            b = int(start[2] + (target[2] - start[2]) * t)
+            self._rgb_svc.dispatch("solid", (r, g, b))
+            await asyncio.sleep(1 / 15)
+        logger.debug("💡 灯光渐变完成 → RGB%s", target)

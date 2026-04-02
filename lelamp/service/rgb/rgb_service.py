@@ -34,6 +34,7 @@ class RGBService(ServiceBase):
         super().__init__("rgb")
 
         self.led_count = led_count
+        self.current_color: tuple = (0, 0, 0)
         if HAS_WS281X:
             self.strip = PixelStrip(
                 led_count, led_pin, led_freq_hz, led_dma,
@@ -65,6 +66,8 @@ class RGBService(ServiceBase):
         for i in range(self.led_count):
             self.strip.setPixelColor(i, color)
         self.strip.show()
+        if isinstance(color_code, tuple) and len(color_code) == 3:
+            self.current_color = color_code
         self.logger.debug(f"Applied solid color: {color_code}")
 
     def _handle_paint(self, colors: List[Union[int, tuple]]):
