@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
+from lelamp.soul.audio_event import AudioEvent
 from lelamp.soul.memory_stream import MemoryStream
 from lelamp.soul.scene_memory import SceneMemory
 from lelamp.soul.speech_budget import SpeechBudget
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class HeardSpeech:
     text: str
+    emotion: str = "neutral"
+    audio_env: str = ""
 
 @dataclass
 class TimerTick:
@@ -384,6 +387,7 @@ class SoulAgent:
         self._awaiting_reply_until: Optional[float] = None
         self._last_activity: float       = 0.0   # 最近一次真实活动时间戳
         self._speech_pending             = asyncio.Event()  # 有语音入队时置位，_think 步间检查
+        # _pending_audio_events 已移除：所有语音统一走 HeardSpeech 打断路径
         self._ticks_since_photo: int     = 0   # 连续未拍照的 TimerTick 次数
 
         # Phase 1 新增
@@ -418,6 +422,31 @@ class SoulAgent:
             self._event_queue.put_nowait(HeardSpeech(text))
         except asyncio.QueueFull:
             logger.debug("事件队列满，heard 已写入记忆，不触发 think")
+
+    async def on_audio_event(self, event: AudioEvent):
+        """
+        由 OmniEar 在收到 AudioEvent 时调用（通过 run_coroutine_threadsafe）。
+        所有语音事件走 HeardSpeech 路径（和 on_speech 行为一致）。
+        """
+        if not event.is_speech or not event.text:
+            return
+
+        importance = 9 if self._awaiting_reply_until else 7
+        self._mem.add("heard", event.text, importance=importance)
+        if self._awaiting_reply_until:
+            self._awaiting_reply_until = None
+
+        self._idle_interval = TIMER_INIT
+        self._last_activity = time.time()
+        self._speech_pending.set()
+        try:
+            self._event_queue.put_nowait(HeardSpeech(
+                text=event.text,
+                emotion=event.emotion,
+                audio_env=event.audio_env,
+            ))
+        except asyncio.QueueFull:
+            logger.debug("事件队列满，语音已写入记忆")
 
     async def run(self):
         """启动自主运行（永不返回，Ctrl-C 退出）"""
@@ -508,7 +537,13 @@ class SoulAgent:
         else:  # HeardSpeech
             self._speech_pending.clear()   # 清除标志，本轮 _think 可以完整运行
             self._event_source = "user"
-            trigger = f"你刚听到有人说：「{event.text}」"
+            trigger_parts = [f"你刚听到有人说：「{event.text}」"]
+            if event.emotion and event.emotion != "neutral":
+                trigger_parts.append(f"用户情绪：{event.emotion}")
+            if event.audio_env:
+                trigger_parts.append(f"环境：{event.audio_env}")
+            trigger_parts.append("请先用 speak 回应用户，再决定是否需要其他行动。")
+            trigger = "\n".join(trigger_parts)
 
         self._last_activity = time.time()
         await self._think(trigger)
@@ -564,10 +599,30 @@ class SoulAgent:
 
         for step in range(max_steps):
             if self._speech_pending.is_set():
-                logger.info("🧠 ReAct 被语音打断，退出 step=%d", step)
-                break
+                self._speech_pending.clear()
+                injected: list[HeardSpeech] = []
+                while not self._event_queue.empty():
+                    try:
+                        ev = self._event_queue.get_nowait()
+                        if isinstance(ev, HeardSpeech):
+                            injected.append(ev)
+                        # TimerTick 直接丢弃
+                    except asyncio.QueueEmpty:
+                        break
+                if injected:
+                    parts = [f"你刚听到有人说：「{ev.text}」" for ev in injected]
+                    inject_text = "\n".join(parts) + "\n请先用 speak 回应用户，再决定是否需要其他行动。"
+                    messages.append({"role": "user", "content": inject_text})
+                    logger.info("🧠 ReAct step=%d 注入语音: %s", step, inject_text)
+
             try:
-                resp = await self._llm.chat_messages(messages, tools=SOUL_TOOLS)
+                resp = await asyncio.wait_for(
+                    self._llm.chat_messages(messages, tools=SOUL_TOOLS),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("🧠 ReAct step=%d LLM 请求超时(15s)，退出", step)
+                break
             except Exception as exc:
                 logger.warning("LLM 调用失败(step=%d): %s", step, exc)
                 self._motion_agent.play_emotion("nod")

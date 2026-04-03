@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import uuid
 import time
-from typing import Optional, List, AsyncGenerator
+from typing import Callable, Optional, List, AsyncGenerator
 from dataclasses import dataclass
 import os
 
@@ -384,6 +384,10 @@ class DoubaoTTSPlayer:
         self._stream_task: Optional[asyncio.Task] = None  # mpg123 流式模式
         self._running = False
 
+        # AEC 回调：播放开始/结束时通知外部（如 OmniEar mute/unmute）
+        self.on_play_start: Optional[Callable[[], None]] = None
+        self.on_play_end: Optional[Callable[[], None]] = None
+
     @staticmethod
     def _clean_markdown(text: str) -> str:
         """去除 Markdown 格式及 TTS 无法朗读的字符"""
@@ -631,6 +635,8 @@ class DoubaoTTSPlayer:
                 continue
 
             self._playing = True
+            if self.on_play_start:
+                self.on_play_start()
             first_frame = True
             total_bytes = 0
 
@@ -730,6 +736,8 @@ class DoubaoTTSPlayer:
                         continue
 
             self._playing = False
+            if self.on_play_end:
+                self.on_play_end()
             elapsed = (time.time() - synth_start) * 1000
             logger.info(f"🔊 豆包 TTS 流式播完: {elapsed:.0f} ms, {total_bytes} bytes")
 
@@ -816,6 +824,8 @@ class DoubaoTTSPlayer:
                 self.first_play_start = time.time()
 
             self._playing = True
+            if self.on_play_start:
+                self.on_play_start()
             try:
                 if self._use_mpg123:
                     await self._play_via_mpg123(audio_data)
@@ -830,6 +840,8 @@ class DoubaoTTSPlayer:
                         pass
             finally:
                 self._playing = False
+                if self.on_play_end:
+                    self.on_play_end()
 
     async def _play_via_mpg123(self, audio_data: bytes):
         """用 mpg123 stdin 播放：无临时文件，启动开销小"""
