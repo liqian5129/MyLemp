@@ -36,6 +36,7 @@ class HeardSpeech:
     text: str
     emotion: str = "neutral"
     audio_env: str = ""
+    user_activity: str = "未知"
 
 @dataclass
 class TimerTick:
@@ -260,7 +261,12 @@ SOUL_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "text": {"type": "string"}
+                "text": {"type": "string"},
+                "emotion": {
+                    "type": "string",
+                    "description": "语气情绪，可选：happy/sad/angry/gentle/surprise/neutral，默认 happy",
+                    "enum": ["happy", "sad", "angry", "gentle", "surprise", "neutral"]
+                }
             },
             "required": ["text"]
         }
@@ -444,6 +450,7 @@ class SoulAgent:
                 text=event.text,
                 emotion=event.emotion,
                 audio_env=event.audio_env,
+                user_activity=event.user_activity,
             ))
         except asyncio.QueueFull:
             logger.debug("事件队列满，语音已写入记忆")
@@ -540,6 +547,8 @@ class SoulAgent:
             trigger_parts = [f"你刚听到有人说：「{event.text}」"]
             if event.emotion and event.emotion != "neutral":
                 trigger_parts.append(f"用户情绪：{event.emotion}")
+            if event.user_activity and event.user_activity != "未知":
+                trigger_parts.append(f"用户正在：{event.user_activity}")
             if event.audio_env:
                 trigger_parts.append(f"环境：{event.audio_env}")
             trigger_parts.append("请先用 speak 回应用户，再决定是否需要其他行动。")
@@ -610,7 +619,17 @@ class SoulAgent:
                     except asyncio.QueueEmpty:
                         break
                 if injected:
-                    parts = [f"你刚听到有人说：「{ev.text}」" for ev in injected]
+                    parts = []
+                    for ev in injected:
+                        line = f"你刚听到有人说：「{ev.text}」"
+                        extras = []
+                        if ev.emotion and ev.emotion != "neutral":
+                            extras.append(f"情绪: {ev.emotion}")
+                        if ev.user_activity and ev.user_activity != "未知":
+                            extras.append(f"行为: {ev.user_activity}")
+                        if extras:
+                            line += f"（{'，'.join(extras)}）"
+                        parts.append(line)
                     inject_text = "\n".join(parts) + "\n请先用 speak 回应用户，再决定是否需要其他行动。"
                     messages.append({"role": "user", "content": inject_text})
                     logger.info("🧠 ReAct step=%d 注入语音: %s", step, inject_text)
@@ -692,8 +711,19 @@ class SoulAgent:
 
         elif name == "speak":
             text = (args.get("text") or "").strip()
+            # LLM emotion → 豆包 TTS 支持的 emotion 映射
+            _EMOTION_MAP = {
+                "happy": "happy",
+                "sad": "sad",
+                "angry": "angry",
+                "gentle": "gentle",
+                "surprise": "surprised",
+                "neutral": "neutral",
+            }
+            raw_emotion = (args.get("emotion") or "").strip()
+            emotion = _EMOTION_MAP.get(raw_emotion) if raw_emotion else None
             if text:
-                await self._tts.speak(text)
+                await self._tts.speak(text, emotion=emotion)
                 self._mem.add("said", text)
                 if self._event_source == "heartbeat":
                     self._speech_budget.record()

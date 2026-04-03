@@ -155,20 +155,18 @@ def curious(pos: dict) -> list:
 
 
 def excited(pos: dict) -> list:
-    """兴奋：臂上下弹跳三次，幅度适中"""
+    """兴奋：臂上下弹跳两次，温和但有活力"""
     bp = pos["base_pitch"]
     ep = pos["elbow_pitch"]
     wp = pos["wrist_pitch"]
-    up_bp = _clamp(bp + 14)
-    up_ep = _clamp(ep - 12)
-    up_wp = _clamp(wp + 12)
+    up_bp = _clamp(bp + 8)
+    up_ep = _clamp(ep - 7)
+    up_wp = _clamp(wp + 7)
     return _build_frames(pos, [
-        ({"base_pitch": up_bp, "elbow_pitch": up_ep, "wrist_pitch": up_wp}, 0.5),
-        ({"base_pitch": bp,    "elbow_pitch": ep,    "wrist_pitch": wp},    0.45),
         ({"base_pitch": up_bp, "elbow_pitch": up_ep, "wrist_pitch": up_wp}, 0.45),
-        ({"base_pitch": bp,    "elbow_pitch": ep,    "wrist_pitch": wp},    0.45),
-        ({"base_pitch": up_bp, "elbow_pitch": up_ep, "wrist_pitch": up_wp}, 0.45),
-        ({"base_pitch": bp,    "elbow_pitch": ep,    "wrist_pitch": wp},    0.55),
+        ({"base_pitch": bp,    "elbow_pitch": ep,    "wrist_pitch": wp},    0.4),
+        ({"base_pitch": up_bp, "elbow_pitch": up_ep, "wrist_pitch": up_wp}, 0.4),
+        ({"base_pitch": bp,    "elbow_pitch": ep,    "wrist_pitch": wp},    0.5),
     ])
 
 
@@ -210,15 +208,15 @@ def scanning(pos: dict) -> list:
 
 
 def shock(pos: dict) -> list:
-    """震惊：灯头猛地后仰，停顿，慢慢回来"""
+    """震惊：灯头快速后仰，停顿，慢慢回来"""
     wp = pos["wrist_pitch"]
     bp = pos["base_pitch"]
-    back_wp = _clamp(wp + 22)
-    back_bp = _clamp(bp - 15)
+    back_wp = _clamp(wp + 14)
+    back_bp = _clamp(bp - 8)
     return _build_frames(pos, [
-        ({"wrist_pitch": back_wp, "base_pitch": back_bp}, 0.25),  # 快速后仰
-        ({},                                               0.4),   # 停顿
-        ({"wrist_pitch": wp, "base_pitch": bp},           0.6),   # 慢慢回来
+        ({"wrist_pitch": back_wp, "base_pitch": back_bp}, 0.3),   # 快速后仰
+        ({},                                               0.35),  # 停顿
+        ({"wrist_pitch": wp, "base_pitch": bp},           0.5),   # 慢慢回来
     ])
 
 

@@ -64,13 +64,25 @@ async def main():
     logger.info("串口: %s", port)
 
     # ── LLM 客户端 ────────────────────────────────────────────────────────────
-    llm = AIClient(
-        provider="kimi",
-        api_key=os.environ["KIMI_API_KEY"],
-        model=os.environ.get("KIMI_MODEL", "kimi-k2.5"),
-        base_url="https://api.moonshot.cn/v1",
-        enable_thinking=os.environ.get("KIMI_THINKING", "").lower() in ("1", "true", "yes"),
-    )
+    llm_provider = os.environ.get("LLM_PROVIDER", "kimi").lower()
+
+    if llm_provider == "qwen":
+        llm = AIClient(
+            provider="qwen",
+            api_key=os.environ["QWEN_API_KEY"],
+            model=os.environ.get("QWEN_MODEL", "qwen3.6-plus"),
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+    elif llm_provider == "kimi":
+        llm = AIClient(
+            provider="kimi",
+            api_key=os.environ["KIMI_API_KEY"],
+            model=os.environ.get("KIMI_MODEL", "kimi-k2.5"),
+            base_url="https://api.moonshot.cn/v1",
+            enable_thinking=os.environ.get("KIMI_THINKING", "").lower() in ("1", "true", "yes"),
+        )
+    else:
+        raise ValueError(f"不支持的 LLM_PROVIDER: {llm_provider}")
 
     # ── 运动服务 ──────────────────────────────────────────────────────────────
     motion_svc = MotionAgent(port=port, lamp_id="lelamp", fps=30)

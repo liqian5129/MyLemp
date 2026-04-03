@@ -16,6 +16,12 @@ def main():
     svc = MotorsService(port=args.port, lamp_id=args.id)
     svc.start()
 
+    # 先自动执行 wake_up 回到 HOME 姿态
+    print("\n执行 wake_up...")
+    svc.dispatch("play", "wake_up")
+    svc.wait_until_idle(timeout=15)
+    print("wake_up 完成")
+
     motions = [args.only] if args.only else list(MOTION_REGISTRY.keys())
 
     print(f"\n共 {len(motions)} 个动作待测试")

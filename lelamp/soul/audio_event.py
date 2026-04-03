@@ -28,5 +28,8 @@ class AudioEvent:
     audio_env: str = ""
     """环境音描述（如 "键盘声停了""安静""多人说话"）。"""
 
+    user_activity: str = "未知"
+    """用户行为（唱歌、敲键盘、吃东西、走路、安静坐着等）。"""
+
     is_speech: bool = True
     """True=语音事件，False=纯环境音/情绪信号。"""

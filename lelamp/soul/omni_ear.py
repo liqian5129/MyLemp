@@ -224,11 +224,12 @@ class OmniEar:
                     emotion=result.get("emotion", "neutral"),
                     intent=result.get("intent", "none"),
                     audio_env=result.get("audio_env", ""),
+                    user_activity=result.get("user_activity", "未知"),
                     is_speech=bool(result.get("text")),
                 )
                 logger.info(
-                    "AudioEvent: text=%r emotion=%s intent=%s env=%r",
-                    event.text, event.emotion, event.intent, event.audio_env,
+                    "AudioEvent: text=%r emotion=%s intent=%s env=%r activity=%r",
+                    event.text, event.emotion, event.intent, event.audio_env, event.user_activity,
                 )
                 if self.on_event and (event.text or event.audio_env):
                     await self.on_event(event)

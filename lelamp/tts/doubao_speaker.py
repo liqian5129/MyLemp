@@ -70,13 +70,14 @@ class DoubaoTTS:
         self.volume_ratio = volume_ratio
         self.pitch_ratio = pitch_ratio
 
-    def _construct_request(self, text: str, reqid: str) -> bytes:
+    def _construct_request(self, text: str, reqid: str, emotion: str | None = None) -> bytes:
         """
         构建 TTS 请求
 
         Args:
             text: 要合成的文本
             reqid: 请求 ID
+            emotion: 情绪，None 则使用默认值
 
         Returns:
             gzip 压缩后的请求数据
@@ -96,7 +97,7 @@ class DoubaoTTS:
                 "speed_ratio": self.speed_ratio,
                 "volume_ratio": self.volume_ratio,
                 "pitch_ratio": self.pitch_ratio,
-                "emotion": self.emotion
+                "emotion": emotion or self.emotion
             },
             "request": {
                 "reqid": reqid,
@@ -105,6 +106,8 @@ class DoubaoTTS:
                 "operation": "submit"
             }
         }
+
+        logger.info("🎵 TTS 请求: text=%r emotion=%s voice=%s", text[:30], emotion or self.emotion, self.voice_type)
 
         # 压缩 payload
         payload_bytes = json.dumps(payload).encode('utf-8')
@@ -121,13 +124,14 @@ class DoubaoTTS:
 
         return header + size + compressed
 
-    async def synthesize(self, text: str, max_retries: int = 3) -> Optional[bytes]:
+    async def synthesize(self, text: str, max_retries: int = 3, emotion: str | None = None) -> Optional[bytes]:
         """
         流式合成语音，失败时自动重试（最多 max_retries 次）
 
         Args:
             text: 要合成的文本
             max_retries: 最大重试次数
+            emotion: 情绪，None 则使用默认值
 
         Returns:
             MP3 音频数据
@@ -136,7 +140,7 @@ class DoubaoTTS:
             return None
 
         for attempt in range(max_retries):
-            result = await self._synthesize_once(text)
+            result = await self._synthesize_once(text, emotion=emotion)
             if result is not None:
                 return result
             if attempt < max_retries - 1:
@@ -147,7 +151,7 @@ class DoubaoTTS:
         logger.error(f"❌ 豆包 TTS 重试 {max_retries} 次后仍失败")
         return None
 
-    async def _synthesize_once(self, text: str) -> Optional[bytes]:
+    async def _synthesize_once(self, text: str, emotion: str | None = None) -> Optional[bytes]:
         """单次合成尝试"""
         reqid = str(uuid.uuid4())
         audio_chunks = []
@@ -158,7 +162,7 @@ class DoubaoTTS:
             auth_headers = {"Authorization": f"Bearer; {self.token}"}
             async with websockets.connect(self.WS_URL, additional_headers=auth_headers) as ws:
                 # 发送合成请求
-                request_data = self._construct_request(text, reqid)
+                request_data = self._construct_request(text, reqid, emotion=emotion)
                 await ws.send(request_data)
 
                 # 接收音频数据
@@ -259,7 +263,7 @@ class DoubaoTTS:
             logger.error(f"❌ 豆包 TTS 请求失败: {e}")
             return None
 
-    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+    async def synthesize_stream(self, text: str, emotion: str | None = None) -> AsyncGenerator[bytes, None]:
         """
         流式合成：WebSocket 每帧到达即 yield，首帧延迟约 0.3-0.8s。
         调用方可以在首帧到达时立即开始播放，无需等待全部合成完成。
@@ -272,7 +276,7 @@ class DoubaoTTS:
 
         try:
             async with websockets.connect(self.WS_URL, additional_headers=auth_headers) as ws:
-                await ws.send(self._construct_request(text, reqid))
+                await ws.send(self._construct_request(text, reqid, emotion=emotion))
 
                 while True:
                     try:
@@ -514,13 +518,20 @@ class DoubaoTTSPlayer:
         except Exception as e:
             logger.warning(f"清理临时文件失败: {e}")
 
-    async def speak(self, text: str, interrupt: bool = False) -> bool:
-        """将文本送入合成队列"""
+    async def speak(self, text: str, interrupt: bool = False, emotion: str | None = None) -> bool:
+        """将文本送入合成队列
+
+        Args:
+            text: 要合成的文本
+            interrupt: 是否打断当前播放
+            emotion: 本次语音的情绪，None 则使用默认值
+        """
         if not text.strip():
             return False
 
         self._synthesis_done.clear()
         segments = self._split_text(text.strip())
+        use_emotion = emotion or self.tts.emotion
 
         try:
             if interrupt:
@@ -536,7 +547,7 @@ class DoubaoTTSPlayer:
                 request = TTSRequest(
                     text=segment,
                     voice_type=self.tts.voice_type,
-                    emotion=self.tts.emotion,
+                    emotion=use_emotion,
                     speed_ratio=self.tts.speed_ratio,
                     volume_ratio=self.tts.volume_ratio,
                     pitch_ratio=self.tts.pitch_ratio,
@@ -582,10 +593,10 @@ class DoubaoTTSPlayer:
             return 0.0
 
     # ── 流式合成+播放协程（mpg123 模式）────────────────────────────────────────
-    async def _do_synth_to_queue(self, text: str, queue: asyncio.Queue):
+    async def _do_synth_to_queue(self, text: str, queue: asyncio.Queue, emotion: str | None = None):
         """在独立 Task 中运行 synthesize_stream，将音频帧放入 queue，结束后放 None sentinel。"""
         try:
-            async for frame in self.tts.synthesize_stream(text):
+            async for frame in self.tts.synthesize_stream(text, emotion=emotion):
                 await queue.put(frame)
         except Exception as e:
             logger.error(f"❌ 合成帧收集失败: {e}")
@@ -613,7 +624,7 @@ class DoubaoTTSPlayer:
                     continue
                 cur_frames_q: asyncio.Queue = asyncio.Queue()
                 cur_synth_task = asyncio.create_task(
-                    self._do_synth_to_queue(cur_request.text, cur_frames_q)
+                    self._do_synth_to_queue(cur_request.text, cur_frames_q, emotion=cur_request.emotion)
                 )
 
             # ── 启动 mpg123 ───────────────────────────────────────────────
@@ -688,7 +699,7 @@ class DoubaoTTSPlayer:
                     next_req = self._text_queue.get_nowait()
                     next_frames_q: asyncio.Queue = asyncio.Queue()
                     next_synth_task = asyncio.create_task(
-                        self._do_synth_to_queue(next_req.text, next_frames_q)
+                        self._do_synth_to_queue(next_req.text, next_frames_q, emotion=next_req.emotion)
                     )
                     next_item = (next_req, next_frames_q, next_synth_task)
                     logger.debug(f"📦 预合成下一段: {next_req.text[:20]}...")
@@ -761,7 +772,7 @@ class DoubaoTTSPlayer:
                 self.first_synth_start = time.time()
 
             synth_start = time.time()
-            audio_data = await self.tts.synthesize(request.text)
+            audio_data = await self.tts.synthesize(request.text, emotion=request.emotion)
             synth_time = (time.time() - synth_start) * 1000
 
             if self._interrupt_event.is_set():

@@ -51,7 +51,7 @@ class AIClient:
                  reasoning_effort: Optional[str] = None):
         """
         Args:
-            provider: 提供商 - "kimi" 或 "doubao"
+            provider: 提供商 - "kimi"、"qwen" 或 "doubao"
             api_key: API 密钥
             model: 模型名称
             base_url: API 基础 URL
@@ -87,6 +87,8 @@ class AIClient:
             if "k2" in self.model and not self.enable_thinking:
                 return 0.6
             return 1.0
+        elif self.provider == "qwen":
+            return 0.7
         else:  # doubao
             return 0.7
 
@@ -447,10 +449,10 @@ class AIClient:
             message = response.choices[0].message
             text = message.content or ""
 
-            # Kimi thinking 模式：reasoning_content 是思考链
+            # thinking 模式：reasoning_content 是思考链
             reasoning = getattr(message, "reasoning_content", None) or ""
             if reasoning:
-                logger.info("🧠 Kimi 思考链:\n%s", reasoning)
+                logger.info("🧠 思考链:\n%s", reasoning)
 
             tool_calls = []
             raw_assistant_message = None

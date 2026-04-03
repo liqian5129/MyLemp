@@ -23,6 +23,7 @@ _SYSTEM_PROMPT = (
     "- emotion: 从语气判断说话者情绪：neutral/happy/tired/frustrated/curious/sad\n"
     "- intent: 判断意图：new_request（新指令）/ supplement（补充）/ cancel（取消）/ chat（闲聊）\n"
     "- audio_env: 描述背景环境音（安静、键盘声、多人说话等）\n"
+    "- user_activity: 判断用户正在做什么（唱歌、敲键盘、吃东西、走路、与他人交谈等，无法判断则填'未知'）\n"
 )
 
 _REPORT_TOOL = {
@@ -45,13 +46,14 @@ _REPORT_TOOL = {
                     "description": "用户意图",
                 },
                 "audio_env": {"type": "string", "description": "环境音描述"},
+                "user_activity": {"type": "string", "description": "用户正在做的事（唱歌、敲键盘、吃东西、走路、安静坐着、与他人交谈等）"},
             },
-            "required": ["text", "emotion", "intent", "audio_env"],
+            "required": ["text", "emotion", "intent", "audio_env", "user_activity"],
         },
     },
 }
 
-_DEFAULT_RESULT = {"text": "", "emotion": "neutral", "intent": "chat", "audio_env": ""}
+_DEFAULT_RESULT = {"text": "", "emotion": "neutral", "intent": "chat", "audio_env": "", "user_activity": "未知"}
 
 
 def _pcm_to_wav_base64(pcm_bytes: bytes, sample_rate: int) -> str:
