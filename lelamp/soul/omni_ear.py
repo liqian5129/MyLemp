@@ -1,6 +1,7 @@
 """OmniEar — 小Q 的智能耳朵。
 
 本地 VAD（RMS 自适应阈值）检测语音段 → HTTP Omni（qwen3-omni-flash）结构化分析。
+并行执行本地声纹提取，与 HTTP 请求同步完成，不增加端到端延迟。
 替换 ContinuousListener + FunASR。
 """
 from __future__ import annotations
@@ -10,13 +11,16 @@ import logging
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, Coroutine, Optional
+from typing import Callable, Coroutine, Optional, TYPE_CHECKING
 
 import numpy as np
 import sounddevice as sd
 
 from lelamp.soul.audio_event import AudioEvent
 from lelamp.voice.qwen_omni_http import QwenOmniHTTPClient
+
+if TYPE_CHECKING:
+    from lelamp.soul.identity_memory import IdentityMemory
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +30,7 @@ _CHANNELS = 1
 _CHUNK_FRAMES = 1600       # 100ms @ 16kHz
 
 # ── VAD 默认参数 ──────────────────────────────────────────────────────────────
-_SILENCE_SEC = 1.2         # 连续静音多久截断一段
+_SILENCE_SEC = 1.6         # 连续静音多久截断一段
 _MAX_DURATION = 30.0       # 单段最长秒数
 _MIN_DURATION = 0.3        # 短于此的片段丢弃
 _CALIBRATION_SEC = 2.0     # 噪底校准时长
@@ -62,6 +66,7 @@ class OmniEar:
         min_duration: float = _MIN_DURATION,
         calibration_sec: float = _CALIBRATION_SEC,
         input_device: Optional[int] = None,
+        identity_memory: Optional[IdentityMemory] = None,
     ):
         self._http_client = QwenOmniHTTPClient(api_key=api_key, model=model)
         self._silence_sec = silence_sec
@@ -69,6 +74,10 @@ class OmniEar:
         self._min_duration = min_duration
         self._calibration_sec = calibration_sec
         self._input_device = input_device
+        self._identity_memory = identity_memory
+
+        # 声纹编码器（懒加载）
+        self._voice_encoder = None
 
         # VAD 状态
         self._state = _VADState.IDLE
@@ -87,9 +96,36 @@ class OmniEar:
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
+    def _init_voice_encoder(self) -> None:
+        """懒加载 resemblyzer VoiceEncoder（首次约 1-2 秒）。"""
+        if self._voice_encoder is not None:
+            return
+        if self._identity_memory is None:
+            return
+        try:
+            from resemblyzer import VoiceEncoder
+            self._voice_encoder = VoiceEncoder()
+            logger.info("声纹编码器已加载")
+        except ImportError:
+            logger.warning("resemblyzer 未安装，声纹识别不可用")
+        except Exception as exc:
+            logger.warning("声纹编码器加载失败: %s", exc)
+
+    def extract_voice_embedding(self, pcm_data: bytes) -> Optional[np.ndarray]:
+        """从 int16 PCM 提取声纹 embedding。同步方法，约 50-100ms。"""
+        if self._voice_encoder is None:
+            return None
+        try:
+            audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+            return self._voice_encoder.embed_utterance(audio)
+        except Exception as exc:
+            logger.debug("声纹提取失败: %s", exc)
+            return None
+
     async def start(self) -> None:
-        """校准噪底 → 开启麦克风流。"""
+        """校准噪底 → 加载声纹编码器 → 开启麦克风流。"""
         self._loop = asyncio.get_running_loop()
+        self._init_voice_encoder()
         self._calibrate()
 
         stream_kwargs = {
@@ -218,7 +254,20 @@ class OmniEar:
 
         async def _do():
             try:
-                result = await self._http_client.analyze_audio(pcm_data, _SAMPLE_RATE)
+                # 并行：HTTP Omni 分析 + 本地声纹提取
+                omni_task = asyncio.create_task(
+                    self._http_client.analyze_audio(pcm_data, _SAMPLE_RATE)
+                )
+                voice_fut = self._loop.run_in_executor(
+                    None, self.extract_voice_embedding, pcm_data
+                )
+                result, voice_emb = await asyncio.gather(omni_task, voice_fut)
+
+                # 声纹比对（<1ms）
+                speaker = None
+                if voice_emb is not None and self._identity_memory is not None:
+                    speaker = self._identity_memory.identify_voice(voice_emb)
+
                 event = AudioEvent(
                     text=result.get("text", ""),
                     emotion=result.get("emotion", "neutral"),
@@ -226,10 +275,13 @@ class OmniEar:
                     audio_env=result.get("audio_env", ""),
                     user_activity=result.get("user_activity", "未知"),
                     is_speech=bool(result.get("text")),
+                    speaker=speaker,
+                    voice_embedding=voice_emb,
                 )
                 logger.info(
-                    "AudioEvent: text=%r emotion=%s intent=%s env=%r activity=%r",
-                    event.text, event.emotion, event.intent, event.audio_env, event.user_activity,
+                    "AudioEvent: text=%r emotion=%s intent=%s env=%r activity=%r speaker=%s",
+                    event.text, event.emotion, event.intent,
+                    event.audio_env, event.user_activity, event.speaker,
                 )
                 if self.on_event and (event.text or event.audio_env):
                     await self.on_event(event)

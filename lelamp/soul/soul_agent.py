@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import Optional
 
 from lelamp.soul.audio_event import AudioEvent
+from lelamp.soul.identity_memory import IdentityMemory
 from lelamp.soul.memory_stream import MemoryStream
 from lelamp.soul.scene_memory import SceneMemory
 from lelamp.soul.speech_budget import SpeechBudget
@@ -37,6 +38,8 @@ class HeardSpeech:
     emotion: str = "neutral"
     audio_env: str = ""
     user_activity: str = "未知"
+    speaker: str | None = None
+    voice_embedding: object = None  # np.ndarray, 供 register_voice 使用
 
 @dataclass
 class TimerTick:
@@ -84,10 +87,19 @@ look 返回值包含当前关节角度，可以把"这个角度看到了什么"�
 但"找"的任务一定要包含 look，否则就是假装在找。
 </vision>
 
+<identity_recognition>
+你能通过声音和面孔认出熟悉的人。
+当识别出说话者身份时，自然地使用对方的名字。
+如果有人让你"记住我的声音"或"记住我的脸"，用 register_voice / register_face 记住。
+注册完成后以后就能自动认出这个人了。多次注册同一个人（不同角度/音量）可以提高识别率。
+</identity_recognition>
+
 <tool_selection>
   回应对话、表达情绪 → express_emotion
   想看某个方向、追踪声源、探索 → body_move
   想看眼前有什么 → look
+  记住某人的声音 → register_voice（需要刚听到语音）
+  记住某人的脸 → look + register_face（需要先看到人脸）
   组合：先 body_move 转向，再 look 观察，再 express_emotion 表达
   正在执行动作时，不急于发新动作，除非有更重要的事
 </tool_selection>
@@ -366,6 +378,35 @@ SOUL_TOOLS = [
             "required": ["mood"]
         }
     },
+    {
+        "name": "register_voice",
+        "description": (
+            "记住当前说话者的声音。之后听到同样的声音就能认出是谁。\n"
+            "必须在刚听到语音后使用。适用场景：用户说'记住我的声音，我是XXX'。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "这个人的名字"}
+            },
+            "required": ["name"]
+        }
+    },
+    {
+        "name": "register_face",
+        "description": (
+            "记住当前看到的人的脸。之后看到同一个人就能认出来。\n"
+            "必须在刚执行 look 后使用（需要先看到人脸）。\n"
+            "如果画面中有多张脸，会记住最大的那张。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "这个人的名字"}
+            },
+            "required": ["name"]
+        }
+    },
 ]
 
 
@@ -380,13 +421,15 @@ class SoulAgent:
         await agent.run()   # 永不返回
     """
 
-    def __init__(self, motion_agent, rgb_svc, tts, mem: MemoryStream, llm):
+    def __init__(self, motion_agent, rgb_svc, tts, mem: MemoryStream, llm,
+                 identity_memory: Optional[IdentityMemory] = None):
         self._motion_agent = motion_agent
         self._rgb_svc      = rgb_svc
         self._tts          = tts
         self._mem          = mem
         self._llm          = llm
         self._camera       = None   # 由 set_camera() 注入，供 take_photo 工具使用
+        self._identity_memory = identity_memory or IdentityMemory()
 
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
         self._idle_interval              = TIMER_INIT
@@ -402,9 +445,64 @@ class SoulAgent:
         self._light_task: Optional[asyncio.Task] = None   # 灯光渐变任务
         self._event_source: str = "user"   # 当前事件来源：heartbeat / user
 
+        # 身份识别
+        self._last_voice_embedding = None   # 缓存最近语音段的声纹 embedding
+        self._last_face_embeddings: list = []  # 缓存最近 look 的人脸 embedding
+        self._face_analyzer = None  # insightface，懒加载
+
     def set_camera(self, camera):
         """注入 CameraCapture 实例，启用 take_photo 工具"""
         self._camera = camera
+
+    def _get_face_analyzer(self):
+        """懒加载 insightface FaceAnalysis。"""
+        if self._face_analyzer is not None:
+            return self._face_analyzer
+        try:
+            import insightface
+            self._face_analyzer = insightface.app.FaceAnalysis(
+                allowed_modules=["detection", "recognition"],
+                providers=["CPUExecutionProvider"],
+            )
+            self._face_analyzer.prepare(ctx_id=0, det_size=(320, 320))
+            logger.info("人脸分析器已加载")
+        except ImportError:
+            logger.warning("insightface 未安装，人脸识别不可用")
+        except Exception as exc:
+            logger.warning("人脸分析器加载失败: %s", exc)
+        return self._face_analyzer
+
+    def _detect_and_identify_faces(self, image_path: str) -> tuple[str, list]:
+        """检测图片中的人脸并识别身份。返回 (描述字符串, embedding列表)。"""
+        import cv2
+        analyzer = self._get_face_analyzer()
+        if analyzer is None:
+            return "", []
+
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                return "", []
+            faces = analyzer.get(img)
+        except Exception as exc:
+            logger.debug("人脸检测失败: %s", exc)
+            return "", []
+
+        if not faces:
+            return "", []
+
+        results = []
+        embeddings = []
+        for face in faces:
+            emb = face.embedding
+            embeddings.append(emb)
+            name = self._identity_memory.identify_face(emb)
+            if name:
+                results.append(name)
+            else:
+                results.append("陌生人")
+
+        return "、".join(results), embeddings
 
     # ── 公共接口 ──────────────────────────────────────────────────────────────
 
@@ -445,12 +543,18 @@ class SoulAgent:
         self._idle_interval = TIMER_INIT
         self._last_activity = time.time()
         self._speech_pending.set()
+        # 缓存声纹 embedding 供 register_voice 工具使用
+        if event.voice_embedding is not None:
+            self._last_voice_embedding = event.voice_embedding
+
         try:
             self._event_queue.put_nowait(HeardSpeech(
                 text=event.text,
                 emotion=event.emotion,
                 audio_env=event.audio_env,
                 user_activity=event.user_activity,
+                speaker=event.speaker,
+                voice_embedding=event.voice_embedding,
             ))
         except asyncio.QueueFull:
             logger.debug("事件队列满，语音已写入记忆")
@@ -544,9 +648,12 @@ class SoulAgent:
         else:  # HeardSpeech
             self._speech_pending.clear()   # 清除标志，本轮 _think 可以完整运行
             self._event_source = "user"
-            trigger_parts = [f"你刚听到有人说：「{event.text}」"]
+            if event.speaker:
+                trigger_parts = [f"你听到 {event.speaker} 说：「{event.text}」"]
+            else:
+                trigger_parts = [f"你刚听到有人说：「{event.text}」"]
             if event.emotion and event.emotion != "neutral":
-                trigger_parts.append(f"用户情绪：{event.emotion}")
+                trigger_parts.append(f"说话者情绪：{event.emotion}")
             if event.user_activity and event.user_activity != "未知":
                 trigger_parts.append(f"用户正在：{event.user_activity}")
             if event.audio_env:
@@ -621,7 +728,10 @@ class SoulAgent:
                 if injected:
                     parts = []
                     for ev in injected:
-                        line = f"你刚听到有人说：「{ev.text}」"
+                        if ev.speaker:
+                            line = f"你听到 {ev.speaker} 说：「{ev.text}」"
+                        else:
+                            line = f"你刚听到有人说：「{ev.text}」"
                         extras = []
                         if ev.emotion and ev.emotion != "neutral":
                             extras.append(f"情绪: {ev.emotion}")
@@ -771,8 +881,19 @@ class SoulAgent:
                     self._ticks_since_photo = 0
                     current = self._motion_agent._get_current_pos()
                     pos_str = ", ".join(f"{k}={v:.0f}" for k, v in current.items())
-                    logger.info("📸 look: 已获取画面 → %s", snap)
-                    return f"已获取画面（当前关节：{pos_str}）", snap
+
+                    # 并行人脸识别（在 executor 中，不阻塞事件循环）
+                    loop = asyncio.get_running_loop()
+                    face_desc, face_embs = await loop.run_in_executor(
+                        None, self._detect_and_identify_faces, snap
+                    )
+                    self._last_face_embeddings = face_embs
+
+                    result_text = f"已获取画面（当前关节：{pos_str}）"
+                    if face_desc:
+                        result_text += f"\n检测到的人：{face_desc}"
+                    logger.info("📸 look: %s faces=%s", snap, face_desc or "无")
+                    return result_text, snap
                 logger.warning("📸 look: take_snapshot 返回 None（相机无帧）")
             else:
                 logger.warning("📸 look: 相机未注入（_camera is None）")
@@ -795,6 +916,28 @@ class SoulAgent:
                 self._transition_light(color), name="light-transition"
             )
             return f"灯光氛围：{mood}", None
+
+        elif name == "register_voice":
+            person_name = (args.get("name") or "").strip()
+            if not person_name:
+                return "请提供名字", None
+            if self._last_voice_embedding is None:
+                return "没有可用的声纹数据，需要先听到语音", None
+            count = self._identity_memory.register_voice(person_name, self._last_voice_embedding)
+            self._mem.add("did", f"记住了 {person_name} 的声音（第 {count} 条声纹）")
+            return f"已记住 {person_name} 的声音！以后听到就能认出来了", None
+
+        elif name == "register_face":
+            person_name = (args.get("name") or "").strip()
+            if not person_name:
+                return "请提供名字", None
+            if not self._last_face_embeddings:
+                return "没有可用的人脸数据，需要先用 look 看到人脸", None
+            # 取最大的那张脸（面积最大 = 离镜头最近）
+            emb = self._last_face_embeddings[0]
+            count = self._identity_memory.register_face(person_name, emb)
+            self._mem.add("did", f"记住了 {person_name} 的脸（第 {count} 条人脸）")
+            return f"已记住 {person_name} 的脸！以后看到就能认出来了", None
 
         elif name == "wait":
             reason = (args.get("reason") or "").strip()

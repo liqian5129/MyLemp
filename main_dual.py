@@ -22,7 +22,7 @@
 import asyncio
 import logging
 import os
-from logging.handlers import RotatingFileHandler
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,6 +31,7 @@ from lelamp.agent.ai_client import AIClient
 from lelamp.motion.motion_agent import MotionAgent
 from lelamp.service.rgb.rgb_service import RGBService
 from lelamp.soul.camera_capture import CameraCapture
+from lelamp.soul.identity_memory import IdentityMemory
 from lelamp.soul.memory_stream import MemoryStream
 from lelamp.soul.omni_ear import OmniEar
 from lelamp.soul.soul_agent import SoulAgent
@@ -47,12 +48,8 @@ _fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s")
 _console = logging.StreamHandler()
 _console.setFormatter(_fmt)
 
-_file = RotatingFileHandler(
-    _LOG_DIR / "soul.log",
-    maxBytes=5 * 1024 * 1024,
-    backupCount=5,
-    encoding="utf-8",
-)
+_log_file = _LOG_DIR / f"soul_{datetime.now():%Y%m%d_%H%M%S}.log"
+_file = logging.FileHandler(_log_file, encoding="utf-8")
 _file.setFormatter(_fmt)
 
 logging.basicConfig(level=logging.INFO, handlers=[_console, _file])
@@ -115,10 +112,11 @@ async def main():
     )
     await tts.start()
 
-    # ── 记忆 + 智能体 ─────────────────────────────────────────────────────────
+    # ── 身份识别 + 记忆 + 智能体 ────────────────────────────────────────────────
+    identity_mem = IdentityMemory()
     mem = MemoryStream()
     mem.start()
-    agent = SoulAgent(motion_svc, rgb_svc, tts, mem, llm)
+    agent = SoulAgent(motion_svc, rgb_svc, tts, mem, llm, identity_memory=identity_mem)
 
     # ── 开机动作 ──────────────────────────────────────────────────────────────
     motion_svc.play_emotion("wake_up")
@@ -137,6 +135,7 @@ async def main():
         api_key=os.environ.get("DASHSCOPE_API_KEY"),
         silence_sec=float(os.environ.get("OMNI_SILENCE_SEC", "1.2")),
         input_device=int(os.environ["AUDIO_INPUT_DEVICE"]) if os.environ.get("AUDIO_INPUT_DEVICE") else None,
+        identity_memory=identity_mem,
     )
     ear.on_event = agent.on_audio_event
 

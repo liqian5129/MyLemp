@@ -1,6 +1,7 @@
 """Omni 智能耳朵 → SoulAgent 的结构化音频事件。"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -33,3 +34,9 @@ class AudioEvent:
 
     is_speech: bool = True
     """True=语音事件，False=纯环境音/情绪信号。"""
+
+    speaker: Optional[str] = None
+    """声纹识别出的说话者名字，未识别时为 None。"""
+
+    voice_embedding: object = field(default=None, compare=False, repr=False, hash=False)
+    """当前语音段的声纹 embedding（np.ndarray），供 register_voice 工具使用。"""
