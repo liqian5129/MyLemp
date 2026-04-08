@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +37,8 @@ logger = logging.getLogger(__name__)
 class HeardSpeech:
     text: str
     emotion: str = "neutral"
+    intent: str = "none"
+    directed: str = "uncertain"  # to_robot / not_to_robot / uncertain
     audio_env: str = ""
     user_activity: str = "未知"
     speaker: str | None = None
@@ -45,11 +48,21 @@ class HeardSpeech:
 class TimerTick:
     pass
 
+@dataclass
+class EnvironmentChange:
+    audio_env: str = ""
+    user_activity: str = "未知"
+
 # ── 定时器参数 ────────────────────────────────────────────────────────────────
 
-TIMER_INIT = 30.0    # 初始空闲间隔（秒）
-TIMER_MAX  = 120.0   # 最大空闲间隔（秒）
-TIMER_MULT = 2.0     # 每次自主触发后的倍增系数
+TIMER_INTERVAL = 30.0   # 固定心跳间隔（秒）— 感知频率恒定，表达克制由 LLM 决策
+
+# ── 环境事件参数 ──────────────────────────────────────────────────────────────
+
+ENV_SOUND_TRIGGER = os.environ.get("ENV_SOUND_TRIGGER", "0") == "1"
+ENV_TRIGGER_MIN_INTERVAL = 30.0  # 环境触发最小间隔（秒）
+_ROUTINE_ENV_KEYWORDS = frozenset({"安静", "键盘", "打字", "鼠标", "风扇", "空调"})
+_ROUTINE_ACTIVITY_KEYWORDS = frozenset({"安静坐着", "安静", "未知", ""})
 
 # ── 人格提示词（固定，不得修改） ─────────────────────────────────────────────
 
@@ -76,6 +89,8 @@ PERSONALITY_PROMPT = """\
   挺直昂起：base_pitch=-60    前倾：base_pitch=-15
   组合示例——往右上方看：base_yaw=35, wrist_pitch=25
   注意：wrist_pitch 正数=抬头，负数=低垂；base_pitch 负数=直立，正数=前倾
+
+休息姿态：用户说"自己玩""别看了""去休息""不用管我"等类似意思时，你必须立即用 body_move 回到正前方放松姿态（base_yaw=0, base_pitch=-38, wrist_pitch=-47）。不回正就是一直盯着人看，会让用户不舒服。
 </body>
 
 <vision>
@@ -88,10 +103,26 @@ look 返回值包含当前关节角度，可以把"这个角度看到了什么"�
 </vision>
 
 <identity_recognition>
-你能通过声音和面孔认出熟悉的人。
-当识别出说话者身份时，自然地使用对方的名字。
-如果有人让你"记住我的声音"或"记住我的脸"，用 register_voice / register_face 记住。
-注册完成后以后就能自动认出这个人了。多次注册同一个人（不同角度/音量）可以提高识别率。
+你能通过声纹识别认出熟悉的人。**当前对话对象的身份只能由当前触发消息中的 speaker 字段确认**，没有其他可靠的判断方式。
+
+叫名字的唯一条件：当前触发消息里明确写了"你听到 XXX 说"（即本次声纹匹配成功）。
+除此之外的所有情况，绝不能叫名字。
+
+**说话时（speak 工具）**：直接用"你"称呼对方就好，不要说"用户"——那是内部术语，听起来很奇怪。
+**内心思考、wait 的 reason、场景记忆**：可以用"那个人"、"有人"等中性词。
+
+不能叫名字的场景包括：
+
+- "你听到一个未识别的声音说" → 当前声纹没匹配上，不能叫名字
+- 心跳触发（没有 speaker 字段）→ 即使 look 看到了人，也不能叫名字
+- 场景记忆里写着"XXX 在右边"、记忆流里有"XXX 说过……" → 那是过去某次声纹匹配的结果，**不代表现在画面里的人就是同一个人**。隔了几分钟、几小时，眼前的人可能已经换了
+- 上一轮对话里声纹匹配过 XXX → 这一轮新触发必须重新看当前的 speaker 字段，不能假设"还是同一个人"
+
+记忆里的名字只是历史事实，不是当下身份。视觉和记忆推断都可能认错人，叫错名字比不叫更尴尬。
+
+写场景记忆时同理：当前 speaker 字段确认了名字，可以写名字；否则用"用户"、"有人"代替。
+
+如果有人让你"记住我的声音"，用 register_voice 记住。
 </identity_recognition>
 
 <tool_selection>
@@ -99,16 +130,15 @@ look 返回值包含当前关节角度，可以把"这个角度看到了什么"�
   想看某个方向、追踪声源、探索 → body_move
   想看眼前有什么 → look
   记住某人的声音 → register_voice（需要刚听到语音）
-  记住某人的脸 → look + register_face（需要先看到人脸）
-  组合：先 body_move 转向，再 look 观察，再 express_emotion 表达
+  组合：需要"转头+看"时，body_move 和 look 可以同时调用（系统会自动先完成运动再拍照），省一步。只是转头不需要看时，单独调 body_move 即可。
   正在执行动作时，不急于发新动作，除非有更重要的事
 </tool_selection>
 
 <examples>
 <example>
 找人："你找得到我吗？"
-  → body_move(base_yaw=35) + look → 照片里有人 → speak("找到了！")
-  → 照片里没人 → body_move(base_yaw=-35) + look → 继续判断
+  → 同时调用 body_move(base_yaw=35) + look → 照片里有人 → speak("找到了！")
+  → 照片里没人 → 同时调用 body_move(base_yaw=-35) + look → 继续判断
 </example>
 <example>
 找物体："帮我找找杯子"
@@ -345,7 +375,10 @@ SOUL_TOOLS = [
         "description": (
             "更新你对周围环境的记忆。每次 look 看到有意义的内容后调用，"
             "记下各方向有什么、对应的关节参数。下次心跳时你会看到这份记忆。\n"
-            "内容会覆盖旧记忆，请写完整。不超过 200 字。"
+            "内容会覆盖旧记忆，请写完整。不超过 200 字。\n"
+            "**只写长期不变的场景结构**：家具位置、墙面装饰、固定物品、光线方向。\n"
+            "**不要写短期状态**：人当前的穿着、姿态、表情、手里拿的东西、桌面临时物品——"
+            "这些下一秒就会变，写进去只会让你产生错误的执念，反复追问已经过时的事。"
         ),
         "input_schema": {
             "type": "object",
@@ -392,21 +425,6 @@ SOUL_TOOLS = [
             "required": ["name"]
         }
     },
-    {
-        "name": "register_face",
-        "description": (
-            "记住当前看到的人的脸。之后看到同一个人就能认出来。\n"
-            "必须在刚执行 look 后使用（需要先看到人脸）。\n"
-            "如果画面中有多张脸，会记住最大的那张。"
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "这个人的名字"}
-            },
-            "required": ["name"]
-        }
-    },
 ]
 
 
@@ -432,7 +450,6 @@ class SoulAgent:
         self._identity_memory = identity_memory or IdentityMemory()
 
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=5)
-        self._idle_interval              = TIMER_INIT
         self._awaiting_reply_until: Optional[float] = None
         self._last_activity: float       = 0.0   # 最近一次真实活动时间戳
         self._speech_pending             = asyncio.Event()  # 有语音入队时置位，_think 步间检查
@@ -445,64 +462,17 @@ class SoulAgent:
         self._light_task: Optional[asyncio.Task] = None   # 灯光渐变任务
         self._event_source: str = "user"   # 当前事件来源：heartbeat / user
 
+        # 环境事件节流
+        self._last_env_audio_env: str = ""
+        self._last_env_user_activity: str = ""
+        self._last_env_trigger_time: float = 0.0
+
         # 身份识别
         self._last_voice_embedding = None   # 缓存最近语音段的声纹 embedding
-        self._last_face_embeddings: list = []  # 缓存最近 look 的人脸 embedding
-        self._face_analyzer = None  # insightface，懒加载
 
     def set_camera(self, camera):
         """注入 CameraCapture 实例，启用 take_photo 工具"""
         self._camera = camera
-
-    def _get_face_analyzer(self):
-        """懒加载 insightface FaceAnalysis。"""
-        if self._face_analyzer is not None:
-            return self._face_analyzer
-        try:
-            import insightface
-            self._face_analyzer = insightface.app.FaceAnalysis(
-                allowed_modules=["detection", "recognition"],
-                providers=["CPUExecutionProvider"],
-            )
-            self._face_analyzer.prepare(ctx_id=0, det_size=(320, 320))
-            logger.info("人脸分析器已加载")
-        except ImportError:
-            logger.warning("insightface 未安装，人脸识别不可用")
-        except Exception as exc:
-            logger.warning("人脸分析器加载失败: %s", exc)
-        return self._face_analyzer
-
-    def _detect_and_identify_faces(self, image_path: str) -> tuple[str, list]:
-        """检测图片中的人脸并识别身份。返回 (描述字符串, embedding列表)。"""
-        import cv2
-        analyzer = self._get_face_analyzer()
-        if analyzer is None:
-            return "", []
-
-        try:
-            img = cv2.imread(image_path)
-            if img is None:
-                return "", []
-            faces = analyzer.get(img)
-        except Exception as exc:
-            logger.debug("人脸检测失败: %s", exc)
-            return "", []
-
-        if not faces:
-            return "", []
-
-        results = []
-        embeddings = []
-        for face in faces:
-            emb = face.embedding
-            embeddings.append(emb)
-            name = self._identity_memory.identify_face(emb)
-            if name:
-                results.append(name)
-            else:
-                results.append("陌生人")
-
-        return "、".join(results), embeddings
 
     # ── 公共接口 ──────────────────────────────────────────────────────────────
 
@@ -518,7 +488,6 @@ class SoulAgent:
             self._awaiting_reply_until = None   # 无论是否超时都清除
 
         self._mem.add("heard", text, importance=importance)
-        self._idle_interval  = TIMER_INIT
         self._last_activity  = time.time()
         self._speech_pending.set()   # 通知正在运行的 _think 尽快退出
 
@@ -530,34 +499,73 @@ class SoulAgent:
     async def on_audio_event(self, event: AudioEvent):
         """
         由 OmniEar 在收到 AudioEvent 时调用（通过 run_coroutine_threadsafe）。
-        所有语音事件走 HeardSpeech 路径（和 on_speech 行为一致）。
+        语音事件走 HeardSpeech 路径；非语音环境声音走 EnvironmentChange 路径。
         """
-        if not event.is_speech or not event.text:
-            return
+        if event.is_speech and event.text:
+            # ── 语音路径（原有逻辑不变）──
+            importance = 9 if self._awaiting_reply_until else 7
+            self._mem.add("heard", event.text, importance=importance)
+            if self._awaiting_reply_until:
+                self._awaiting_reply_until = None
 
-        importance = 9 if self._awaiting_reply_until else 7
-        self._mem.add("heard", event.text, importance=importance)
-        if self._awaiting_reply_until:
-            self._awaiting_reply_until = None
+            self._last_activity = time.time()
+            self._speech_pending.set()
+            # 缓存声纹 embedding 供 register_voice 工具使用
+            if event.voice_embedding is not None:
+                self._last_voice_embedding = event.voice_embedding
 
-        self._idle_interval = TIMER_INIT
-        self._last_activity = time.time()
-        self._speech_pending.set()
-        # 缓存声纹 embedding 供 register_voice 工具使用
-        if event.voice_embedding is not None:
-            self._last_voice_embedding = event.voice_embedding
+            try:
+                self._event_queue.put_nowait(HeardSpeech(
+                    text=event.text,
+                    emotion=event.emotion,
+                    intent=event.intent,
+                    directed=event.directed,
+                    audio_env=event.audio_env,
+                    user_activity=event.user_activity,
+                    speaker=event.speaker,
+                    voice_embedding=event.voice_embedding,
+                ))
+            except asyncio.QueueFull:
+                logger.debug("事件队列满，语音已写入记忆")
 
-        try:
-            self._event_queue.put_nowait(HeardSpeech(
-                text=event.text,
-                emotion=event.emotion,
-                audio_env=event.audio_env,
-                user_activity=event.user_activity,
-                speaker=event.speaker,
-                voice_embedding=event.voice_embedding,
-            ))
-        except asyncio.QueueFull:
-            logger.debug("事件队列满，语音已写入记忆")
+        elif ENV_SOUND_TRIGGER and not event.is_speech and event.audio_env:
+            # ── 环境声音路径 ──
+
+            # (1) TTS 回声过滤：机器人自己在说话时忽略
+            if self._tts.is_playing():
+                return
+
+            # (2) 常规声音过滤：打字、安静等日常声音不触发
+            #     但如果 activity 有意义（如咳嗽），仍然放行
+            activity = (event.user_activity or "").strip()
+            has_notable_activity = activity and activity not in _ROUTINE_ACTIVITY_KEYWORDS
+            if (any(kw in event.audio_env for kw in _ROUTINE_ENV_KEYWORDS)
+                    and not has_notable_activity):
+                return
+
+            # (3) 节流 + 去重
+            now = time.time()
+            if now - self._last_env_trigger_time < ENV_TRIGGER_MIN_INTERVAL:
+                return
+            if (event.audio_env == self._last_env_audio_env
+                    and event.user_activity == self._last_env_user_activity):
+                return
+
+            # 通过过滤，更新状态并入队
+            self._last_env_audio_env = event.audio_env
+            self._last_env_user_activity = event.user_activity
+            self._last_env_trigger_time = now
+
+            self._mem.add("heard", f"[环境] {event.audio_env}", importance=4)
+            logger.info("🔔 环境事件触发: env=%r activity=%r", event.audio_env, event.user_activity)
+
+            try:
+                self._event_queue.put_nowait(EnvironmentChange(
+                    audio_env=event.audio_env,
+                    user_activity=event.user_activity,
+                ))
+            except asyncio.QueueFull:
+                pass
 
     async def run(self):
         """启动自主运行（永不返回，Ctrl-C 退出）"""
@@ -569,9 +577,7 @@ class SoulAgent:
     # ── 内部：事件循环 ────────────────────────────────────────────────────────
 
     def _is_idle(self) -> bool:
-        """真正空闲：无近期活动 + 队列空 + 不在动作中 + 不在说话"""
-        if time.time() - self._last_activity < self._idle_interval:
-            return False
+        """真正空闲：队列空 + 不在动作中 + 不在说话"""
         if not self._event_queue.empty():
             return False
         if self._motion_agent.is_playing():
@@ -581,9 +587,9 @@ class SoulAgent:
         return True
 
     async def _timer_loop(self):
-        """定时器：真正空闲时才插入 TimerTick，采用指数退避"""
+        """固定间隔心跳：感知频率恒定，表达克制由 LLM 决策"""
         while True:
-            await asyncio.sleep(self._idle_interval)
+            await asyncio.sleep(TIMER_INTERVAL)
             if self._is_idle():
                 try:
                     self._event_queue.put_nowait(TimerTick())
@@ -603,9 +609,6 @@ class SoulAgent:
 
     async def _process_event(self, event):
         if isinstance(event, TimerTick):
-            self._idle_interval = min(
-                self._idle_interval * TIMER_MULT, TIMER_MAX
-            )
             self._ticks_since_photo += 1
             self._event_source = "heartbeat"
 
@@ -645,23 +648,55 @@ class SoulAgent:
                 "按照 <proactive_care> 中的流程决策：先观察，再判断用户状态和是否有新发现，最后决定行动。"
             )
             trigger = "\n".join(trigger_parts)
+        elif isinstance(event, EnvironmentChange):
+            self._event_source = "environment"
+            # 被唤醒的动作 — 让机器人看起来"注意到了什么"
+            self._motion_agent.play_emotion("curious")
+            trigger_parts = ["你感知到环境变化。"]
+            if event.audio_env:
+                trigger_parts.append(f"环境音：{event.audio_env}")
+            if event.user_activity and event.user_activity != "未知":
+                trigger_parts.append(f"用户行为：{event.user_activity}")
+            trigger_parts.append(
+                "用 look 观察一下发生了什么，然后决定如何回应。"
+                "不需要说话，除非你觉得有必要。"
+            )
+            trigger = "\n".join(trigger_parts)
         else:  # HeardSpeech
             self._speech_pending.clear()   # 清除标志，本轮 _think 可以完整运行
             self._event_source = "user"
             if event.speaker:
                 trigger_parts = [f"你听到 {event.speaker} 说：「{event.text}」"]
             else:
-                trigger_parts = [f"你刚听到有人说：「{event.text}」"]
+                trigger_parts = [f"你听到一个未识别的声音说：「{event.text}」（声纹未匹配，不要猜测身份）"]
             if event.emotion and event.emotion != "neutral":
                 trigger_parts.append(f"说话者情绪：{event.emotion}")
             if event.user_activity and event.user_activity != "未知":
                 trigger_parts.append(f"用户正在：{event.user_activity}")
             if event.audio_env:
                 trigger_parts.append(f"环境：{event.audio_env}")
-            trigger_parts.append("请先用 speak 回应用户，再决定是否需要其他行动。")
-            trigger = "\n".join(trigger_parts)
 
-        self._last_activity = time.time()
+            # 根据 directed 字段判断是否需要回应
+            if event.directed == "not_to_robot":
+                trigger_parts.append(
+                    "这段声音不是对你说的（可能是视频、播客、电话、自言自语或与他人交谈）。"
+                    "安静旁听，不要插嘴，用 wait 观察即可。"
+                    "除非被明确叫到名字'小Q'，否则不要回应。"
+                )
+            elif event.directed == "uncertain":
+                trigger_parts.append(
+                    "不确定这段话是否对你说的。谨慎判断："
+                    "只有当内容明显是对你说的（叫了你的名字、直接对你提问或下指令）才回应；"
+                    "如果像是视频、播客、自言自语或与他人交谈的内容，用 wait 安静观察。"
+                )
+            else:
+                trigger_parts.append(
+                    "请先用 speak 回应用户。"
+                    "说话时应该面向用户，用 body_move 转向他所在的方向（参考场景记忆中的位置）。"
+                )
+            trigger = "\n".join(trigger_parts)
+            self._last_activity = time.time()   # 只有语音才算真实活动
+
         await self._think(trigger)
 
         # 异步触发 compact（不等待结果，不阻塞主循环）
@@ -674,7 +709,7 @@ class SoulAgent:
     # ── 内部：认知决策（ReAct 循环） ─────────────────────────────────────────
 
     async def _think(self, trigger: str, image_path: Optional[str] = None,
-                     max_steps: int = 10):
+                     max_steps: int = 15):
         """ReAct 循环：读记忆 → LLM → 执行工具 → 观察 → 继续，直到 LLM 停止"""
         memory_ctx = self._mem.format_for_prompt()
         scene_ctx  = self._scene_memory.read()
@@ -716,6 +751,11 @@ class SoulAgent:
         for step in range(max_steps):
             if self._speech_pending.is_set():
                 self._speech_pending.clear()
+                # 心跳/环境 think 优先级低，直接让出给语音事件走正常队列
+                if self._event_source in ("heartbeat", "environment"):
+                    logger.info("🧠 ReAct step=%d 心跳让出：语音事件到达，退出当前 think", step)
+                    break
+                # 用户语音 think 期间收到新语音 → 注入当前 ReAct 循环
                 injected: list[HeardSpeech] = []
                 while not self._event_queue.empty():
                     try:
@@ -731,7 +771,7 @@ class SoulAgent:
                         if ev.speaker:
                             line = f"你听到 {ev.speaker} 说：「{ev.text}」"
                         else:
-                            line = f"你刚听到有人说：「{ev.text}」"
+                            line = f"你听到一个未识别的声音说：「{ev.text}」"
                         extras = []
                         if ev.emotion and ev.emotion != "neutral":
                             extras.append(f"情绪: {ev.emotion}")
@@ -740,17 +780,30 @@ class SoulAgent:
                         if extras:
                             line += f"（{'，'.join(extras)}）"
                         parts.append(line)
-                    inject_text = "\n".join(parts) + "\n请先用 speak 回应用户，再决定是否需要其他行动。"
+                    # 根据 directed 字段决定引导语
+                    any_to_robot = any(ev.directed == "to_robot" for ev in injected)
+                    all_not_to_robot = all(ev.directed == "not_to_robot" for ev in injected)
+                    if all_not_to_robot:
+                        inject_text = "\n".join(parts) + (
+                            "\n这些声音不是对你说的，安静旁听，用 wait 观察。"
+                        )
+                    elif any_to_robot:
+                        inject_text = "\n".join(parts) + "\n请先用 speak 回应用户。"
+                    else:
+                        inject_text = "\n".join(parts) + (
+                            "\n不确定是否对你说的。只有叫了你的名字或明确对你提问才回应，"
+                            "否则用 wait 安静观察。"
+                        )
                     messages.append({"role": "user", "content": inject_text})
                     logger.info("🧠 ReAct step=%d 注入语音: %s", step, inject_text)
 
             try:
                 resp = await asyncio.wait_for(
                     self._llm.chat_messages(messages, tools=SOUL_TOOLS),
-                    timeout=15.0,
+                    timeout=30.0,
                 )
             except asyncio.TimeoutError:
-                logger.warning("🧠 ReAct step=%d LLM 请求超时(15s)，退出", step)
+                logger.warning("🧠 ReAct step=%d LLM 请求超时(30s)，退出", step)
                 break
             except Exception as exc:
                 logger.warning("LLM 调用失败(step=%d): %s", step, exc)
@@ -765,12 +818,27 @@ class SoulAgent:
                 logger.debug("🧠 ReAct 结束 step=%d  stop=%s", step, resp.stop_reason)
                 break
 
+            # 按依赖关系排序：输出→动作→观察→依赖观察的工具
+            _TOOL_EXEC_ORDER = {
+                "speak": 0,
+                "express_emotion": 1, "body_move": 1,
+                "set_light_mood": 1, "set_rgb_solid": 1,
+                "look": 2,
+                "register_voice": 3,
+                "update_scene_memory": 3,
+                "wait": 9,
+            }
+            sorted_calls = sorted(
+                resp.tool_calls,
+                key=lambda tc: _TOOL_EXEC_ORDER.get(tc.get("name", ""), 5),
+            )
+
             # 执行本轮所有工具，收集结果
             tool_results: list[dict] = []
             observation_image: Optional[str] = None
             called_wait = False
 
-            for tc in resp.tool_calls:
+            for tc in sorted_calls:
                 result_text, snap = await self._execute_tool(tc)
                 tool_results.append({
                     "role": "tool",
@@ -797,14 +865,14 @@ class SoulAgent:
                     messages.append({
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "这是你刚才看到的画面，继续决策："},
+                            {"type": "text", "text": "这是你刚才看到的画面，继续决策（果断选择下一步，没事做就 wait）："},
                             {"type": "image_url", "image_url": {"url": img_data}},
                         ]
                     })
                 else:
-                    messages.append({"role": "user", "content": "继续决策："})
+                    messages.append({"role": "user", "content": "继续决策（果断选择下一步，没事做就 wait）："})
             else:
-                messages.append({"role": "user", "content": "继续决策："})
+                messages.append({"role": "user", "content": "继续决策（果断选择下一步，没事做就 wait）："})
         else:
             logger.warning("⚠️  ReAct 达到最大步数 %d，强制退出", max_steps)
 
@@ -835,7 +903,7 @@ class SoulAgent:
             if text:
                 await self._tts.speak(text, emotion=emotion)
                 self._mem.add("said", text)
-                if self._event_source == "heartbeat":
+                if self._event_source in ("heartbeat", "environment"):
                     self._speech_budget.record()
                 return f"已说：{text}", None
             return "speak: 文本为空", None
@@ -845,7 +913,7 @@ class SoulAgent:
             if question:
                 await self._tts.speak(question)
                 self._mem.add("said", question)
-                if self._event_source == "heartbeat":
+                if self._event_source in ("heartbeat", "environment"):
                     self._speech_budget.record()
                 self._awaiting_reply_until = time.time() + 15.0
                 logger.info("❓ 小Q 提问，15 秒内的回答视为高优先级")
@@ -882,17 +950,8 @@ class SoulAgent:
                     current = self._motion_agent._get_current_pos()
                     pos_str = ", ".join(f"{k}={v:.0f}" for k, v in current.items())
 
-                    # 并行人脸识别（在 executor 中，不阻塞事件循环）
-                    loop = asyncio.get_running_loop()
-                    face_desc, face_embs = await loop.run_in_executor(
-                        None, self._detect_and_identify_faces, snap
-                    )
-                    self._last_face_embeddings = face_embs
-
                     result_text = f"已获取画面（当前关节：{pos_str}）"
-                    if face_desc:
-                        result_text += f"\n检测到的人：{face_desc}"
-                    logger.info("📸 look: %s faces=%s", snap, face_desc or "无")
+                    logger.info("📸 look: %s", snap)
                     return result_text, snap
                 logger.warning("📸 look: take_snapshot 返回 None（相机无帧）")
             else:
@@ -927,22 +986,8 @@ class SoulAgent:
             self._mem.add("did", f"记住了 {person_name} 的声音（第 {count} 条声纹）")
             return f"已记住 {person_name} 的声音！以后听到就能认出来了", None
 
-        elif name == "register_face":
-            person_name = (args.get("name") or "").strip()
-            if not person_name:
-                return "请提供名字", None
-            if not self._last_face_embeddings:
-                return "没有可用的人脸数据，需要先用 look 看到人脸", None
-            # 取最大的那张脸（面积最大 = 离镜头最近）
-            emb = self._last_face_embeddings[0]
-            count = self._identity_memory.register_face(person_name, emb)
-            self._mem.add("did", f"记住了 {person_name} 的脸（第 {count} 条人脸）")
-            return f"已记住 {person_name} 的脸！以后看到就能认出来了", None
-
         elif name == "wait":
             reason = (args.get("reason") or "").strip()
-            if reason:
-                self._mem.add("felt", reason, importance=4)
             logger.info("⏸️  wait: %s", reason or "（无原因）")
             return f"保持观察：{reason}", None
 

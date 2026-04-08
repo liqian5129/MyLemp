@@ -97,6 +97,9 @@ class AIClient:
         # Kimi K2.5 关闭 thinking
         if self.provider == "kimi" and "k2" in self.model and not self.enable_thinking:
             return {"thinking": {"type": "disabled"}}
+        # Qwen3 关闭 thinking，避免思考链死循环
+        if self.provider == "qwen":
+            return {"enable_thinking": False}
         return None
 
     def _encode_image(self, image_path: str) -> Optional[str]:

@@ -26,6 +26,13 @@ class AudioEvent:
     - none: 非语音事件（环境音变化、叹气等）
     """
 
+    directed: str = "uncertain"
+    """语音是否对小Q说的：
+    - to_robot: 明确对小Q说话
+    - not_to_robot: 明确不是（视频/播客/自言自语/与他人交谈）
+    - uncertain: 无法确定
+    """
+
     audio_env: str = ""
     """环境音描述（如 "键盘声停了""安静""多人说话"）。"""
 
