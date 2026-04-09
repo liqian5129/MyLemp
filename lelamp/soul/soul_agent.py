@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Optional
 
 from lelamp.motion.compose_motion import MOTION_EXAMPLES
+from lelamp.service.motors.motion_scripts import MOTION_REGISTRY
 from lelamp.soul.audio_event import AudioEvent
 from lelamp.soul.identity_memory import IdentityMemory
 from lelamp.soul.memory_stream import MemoryStream
@@ -79,15 +80,13 @@ PERSONALITY_PROMPT = """\
 你有一个灵活的身体，可以转头、抬头、低头、左右看。
 
 运动方式：
-  express_emotion — 预制情绪动作（10 类），**表达情感首选**。
-                    可配 intensity 旋钮（0.3=克制，1.0=标准，1.5=夸张），
-                    同一动作不同强度会有不同的表演节奏和幅度。
-  compose_motion  — 自定义关键帧动作，**仅当 10 类标准动作表达不出来时用**。
-                    例如复合多关节动作、独特节奏。先填 intent 描述意图再出 segments。
-                    失败率比 express_emotion 高，慎用。
+  express_emotion — 预制情绪动作（10 类），适合简单情绪回应（点头、摇头、开心晃等）。
+                    可配 intensity 旋钮（0.3=克制，1.0=标准，1.5=夸张）。
+  compose_motion  — 自定义关键帧动作，适合**表演、模仿、创意动作**。
+                    当用户要求"表演XX""学XX""做个XX动作"时，compose 能做出更丰富生动的效果。
+                    先填 intent 描述意图再出 segments，参考系统 prompt 中的 <motion_examples>。
   body_move — 直接控制关节角度，当你想看某方向、追踪声源、探索环境，
               或做出情绪动作无法表达的姿态时使用。
-              返回值包含当前关节位置，可以记录到场景记忆中。
 
 方向参考：
   往左看：base_yaw=-40        往右看：base_yaw=40
@@ -132,8 +131,8 @@ look 返回值包含当前关节角度，可以把"这个角度看到了什么"�
 </identity_recognition>
 
 <tool_selection>
-  回应对话、表达情绪 → express_emotion（首选，10 类标准动作 + intensity 旋钮）
-  10 类标准动作表达不出的复合/独特动作 → compose_motion（慎用，失败率较高）
+  简单情绪回应（肯定、否定、开心、难过等） → express_emotion
+  表演、模仿、创意动作（"学XX""做个XX""表演XX"） → compose_motion（效果更丰富；compose 本身就是完整表演，结束后不要再追加 express_emotion）
   想看某个方向、追踪声源、探索 → body_move
   想看眼前有什么 → look
   记住某人的声音 → register_voice（需要刚听到语音）
@@ -293,11 +292,11 @@ SOUL_TOOLS = [
     {
         "name": "compose_motion",
         "description": (
-            "自定义关键帧动作。**仅在 express_emotion 的 10 类标准动作表达不出来时使用**——"
-            "例如复合多关节动作、独特节奏、10 类之外的姿态。\n"
+            "自定义关键帧动作，适合**表演、模仿、创意动作**。\n"
+            "当用户要求'表演XX''学XX''做个XX动作''假装XX'时，优先用此工具——"
+            "它比 express_emotion 能做出更丰富、更贴合语义的效果。\n"
             "你必须先在 intent 字段用一句中文描述动作意图，然后在 segments 给出关键帧列表。\n"
-            "查看系统 prompt 中的 <motion_examples> 段了解 6 个动作示例。\n"
-            "失败率比 express_emotion 高，慎用。"
+            "查看系统 prompt 中的 <motion_examples> 段了解 6 个动作示例。"
         ),
         "input_schema": {
             "type": "object",
@@ -331,7 +330,7 @@ SOUL_TOOLS = [
                                 "type": "number",
                                 "minimum": 0.15,
                                 "maximum": 2.0,
-                                "description": "本段时长（秒）"
+                                "description": "本段时长（秒）。建议 ≥0.3s，低于 0.3s 会被速度安全网拉慢"
                             }
                         },
                         "required": ["joints", "duration"]
@@ -788,7 +787,7 @@ class SoulAgent:
             f"最近记忆：\n{memory_ctx}\n\n"
             f"触发：{trigger}\n\n"
             f"你现在想做什么？\n"
-            f"表达情绪用 express_emotion，"
+            f"简单情绪用 express_emotion，表演/模仿/创意动作用 compose_motion，"
             f"转头/探索/特定姿态用 body_move，"
             f"想说话用 speak，"
             f"想看眼前有什么用 look（随时可调，不需要先转头），"
@@ -955,6 +954,12 @@ class SoulAgent:
         if name == "express_emotion":
             ename     = (args.get("name") or "nod").strip()
             intensity = float(args.get("intensity", 1.0))
+            if ename not in MOTION_REGISTRY:
+                return (
+                    f"express_emotion 失败：'{ename}' 不存在。"
+                    f"可用动作：{sorted(MOTION_REGISTRY.keys())}",
+                    None,
+                )
             self._motion_agent.play_emotion(ename, intensity=intensity)
             return f"情绪动作：{ename} (×{intensity:.1f})", None
 
@@ -966,11 +971,10 @@ class SoulAgent:
             err = self._motion_agent.play_compose(intent, segments)
             if err:
                 return (
-                    f"compose_motion 失败：{err}。"
-                    "请改用 express_emotion 或修正 segments 后重试。",
+                    f"compose_motion 失败：{err}。请修正 segments 后重试。",
                     None,
                 )
-            return f"自定义动作：{intent}", None
+            return f"自定义动作：{intent}（已是完整表演，无需追加动作）", None
 
         elif name == "speak":
             text = (args.get("text") or "").strip()
