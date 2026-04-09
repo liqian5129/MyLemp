@@ -84,7 +84,7 @@ PERSONALITY_PROMPT = """\
                     可配 intensity 旋钮（0.3=克制，1.0=标准，1.5=夸张）。
   compose_motion  — 自定义关键帧动作，适合**表演、模仿、创意动作**。
                     当用户要求"表演XX""学XX""做个XX动作"时，compose 能做出更丰富生动的效果。
-                    先填 intent 描述意图再出 segments，参考系统 prompt 中的 <motion_examples>。
+                    先在 intent 写关节级分解（关节+模式+节奏），再据此出 segments，参考 <motion_examples>。
   body_move — 直接控制关节角度，当你想看某方向、追踪声源、探索环境，
               或做出情绪动作无法表达的姿态时使用。
 
@@ -295,7 +295,7 @@ SOUL_TOOLS = [
             "自定义关键帧动作，适合**表演、模仿、创意动作**。\n"
             "当用户要求'表演XX''学XX''做个XX动作''假装XX'时，优先用此工具——"
             "它比 express_emotion 能做出更丰富、更贴合语义的效果。\n"
-            "你必须先在 intent 字段用一句中文描述动作意图，然后在 segments 给出关键帧列表。\n"
+            "你必须先在 intent 字段写出关节级动作分解（哪些关节、什么模式、什么节奏），再据此写 segments。\n"
             "查看系统 prompt 中的 <motion_examples> 段了解 6 个动作示例。"
         ),
         "input_schema": {
@@ -303,7 +303,7 @@ SOUL_TOOLS = [
             "properties": {
                 "intent": {
                     "type": "string",
-                    "description": "用一句中文描述你要表达的动作和情感意图，例：好奇地歪头并稍微抬手"
+                    "description": "用一句中文写出动作的关节级分解：点名关节、运动模式、节奏。例：base_yaw 左右摆动 + wrist_roll 同向歪头，节奏均匀"
                 },
                 "segments": {
                     "type": "array",

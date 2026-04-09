@@ -88,7 +88,7 @@ MOTION_EXAMPLES = """
 所有数值是绝对关节角度（不是相对当前位置），最后一段都回到 HOME 附近。
 
 示例 1 — nod 点头两次
-intent: 点头表示肯定
+intent: wrist_pitch 两次快速下探回弹，节奏均匀
 segments:
   [{"joints": {"wrist_pitch": -69}, "duration": 0.35},
    {"joints": {"wrist_pitch": -39}, "duration": 0.35},
@@ -96,7 +96,7 @@ segments:
    {"joints": {"wrist_pitch": -47}, "duration": 0.45}]
 
 示例 2 — headshake 摇头
-intent: 摇头表示否定
+intent: base_yaw 左右摆动一个来回，幅度对称
 segments:
   [{"joints": {"base_yaw": -15}, "duration": 0.35},
    {"joints": {"base_yaw":  29}, "duration": 0.40},
@@ -104,7 +104,7 @@ segments:
    {"joints": {"base_yaw":   7}, "duration": 0.40}]
 
 示例 3 — curious 歪头打量
-intent: 好奇地歪头看右边，停顿后回正
+intent: base_yaw 转右 + wrist_roll 同向歪头，停顿一拍后回正
 segments:
   [{"joints": {"base_yaw": 25, "wrist_roll":  22}, "duration": 0.80},
    {"joints": {"base_yaw": 25, "wrist_roll":  22}, "duration": 0.40},
@@ -112,21 +112,21 @@ segments:
    {"joints": {"base_yaw":  7, "wrist_roll":   0}, "duration": 0.80}]
 
 示例 4 — sad 沮丧低头
-intent: 灯头缓缓垂下，停留，再慢慢回来
+intent: wrist_pitch 缓慢降到最低，长停顿，再慢速回正
 segments:
   [{"joints": {"wrist_pitch": -75}, "duration": 1.50},
    {"joints": {"wrist_pitch": -75}, "duration": 1.00},
    {"joints": {"wrist_pitch": -47}, "duration": 1.80}]
 
 示例 5 — shock 震惊后仰
-intent: 灯头快速后仰，停顿，再回正
+intent: wrist_pitch 上扬 + base_pitch 后仰同时快弹，短停顿后回正
 segments:
   [{"joints": {"wrist_pitch": -33, "base_pitch": -46}, "duration": 0.30},
    {"joints": {"wrist_pitch": -33, "base_pitch": -46}, "duration": 0.35},
    {"joints": {"wrist_pitch": -47, "base_pitch": -38}, "duration": 0.50}]
 
 示例 6 — excited 兴奋弹跳两次
-intent: 整臂上下弹跳两次表示兴奋
+intent: base_pitch + elbow_pitch + wrist_pitch 三关节联动，上下弹跳两次
 segments:
   [{"joints": {"base_pitch": -30, "elbow_pitch": 42, "wrist_pitch": -40}, "duration": 0.45},
    {"joints": {"base_pitch": -38, "elbow_pitch": 49, "wrist_pitch": -47}, "duration": 0.40},
@@ -145,7 +145,8 @@ segments:
    ⚠️ 角度变化大但 duration 太短会被速度安全网强制拉伸，动作会比预期慢且失去节奏感。
    总时长不超过 5s
 5. 只写要变的关节，未指定的关节自动维持上一段的值
-6. intent 字段必填，用一句中文描述要表达的动作和情感
+6. intent 字段必填，写出关节级的动作分解（见各示例的 intent 写法）
+7. intent 要写机械分解：点名用哪几个关节、运动模式（摆动/脉冲/渐变/弹跳）、节奏（快慢/停顿），不要只写诗意描述
 </motion_examples>
 """
 
