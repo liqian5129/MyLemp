@@ -29,7 +29,7 @@ from lelamp.motion.motion_agent import MotionAgent
 from lelamp.service.rgb.rgb_service import RGBService
 from lelamp.soul.camera_capture import CameraCapture
 from lelamp.soul.continuous_listener import ContinuousListener
-from lelamp.soul.memory_stream import MemoryStream
+from lelamp.soul.memory import MemoryStream
 from lelamp.soul.soul_agent import SoulAgent
 from lelamp.tts.doubao_speaker import DoubaoTTSPlayer
 from lelamp.utils import find_serial_port
@@ -126,7 +126,6 @@ async def main():
     asr  = create_local_asr()
     await asyncio.to_thread(asr.wait_ready)   # 等 ASR 加载完成（后台线程，不阻塞循环）
     await tts.speak("呼——我醒来了。")
-    mem.add("felt", "刚刚启动，世界感觉是新鲜的", importance=6)
 
     # ── 持续监听（ASR 已就绪，直接启动）─────────────────────────────────────
     listener = ContinuousListener(

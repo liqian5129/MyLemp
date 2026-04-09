@@ -20,14 +20,22 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 from lelamp.soul.audio_event import AudioEvent
-from lelamp.soul.identity_memory import IdentityMemory
-from lelamp.soul.memory_stream import MemoryStream
-from lelamp.soul.scene_memory import SceneMemory
-from lelamp.soul.speech_budget import SpeechBudget
+from lelamp.soul.memory import (
+    FactStore,
+    IdentityMemory,
+    MemoryStream,
+    PendingFactBuffer,
+    SceneMemory,
+    WorldState,
+    extract_facts as _extract_facts,
+    render_context_packet,
+    today_narrative as _today_narrative_fn,
+)
+from lelamp.soul.reminder import ReminderService
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +60,11 @@ class TimerTick:
 class EnvironmentChange:
     audio_env: str = ""
     user_activity: str = "未知"
+
+@dataclass
+class ReminderFired:
+    reminder_id: str
+    text: str
 
 # ── 定时器参数 ────────────────────────────────────────────────────────────────
 
@@ -154,8 +167,8 @@ look 返回值包含当前关节角度，可以把"这个角度看到了什么"�
 </examples>
 
 <memory_format>
-记忆格式：[HH:MM 类型] 内容  或  [MM-DD HH:MM 类型] 内容（非今天的记忆）
-  HEA=听到  SAW=看到  SAI=说过  DID=做过  FEL=感受  THO=反思总结
+记忆格式：[HH:MM 类型 · X 分钟前] 内容  或  [MM-DD HH:MM 类型 · X 天前] 内容（非今天的记忆）
+  HEA=听到  SAI=说过  ACT=工具动作  THO=反思总结
   "--- (间隔 N 小时) ---" 表示中间有一段时间没有互动
 </memory_format>
 
@@ -213,8 +226,17 @@ set_light_mood 是你的情绪灯光，根据心情和时间主动调整。
    - 更新场景记忆
    - 安静等待
 
+在依赖记忆做判断之前，留意每个上下文段的时效性：
+  [STATE]   是当下的即时观察（时间、身体、在场、灯光），永远是最新的
+  [FACTS]   是稳定事实（身份、称谓、偏好），可信但会被新的事实覆盖
+  [TODAY]   是当天发生过的概述，告诉你"今天大致是什么样的一天"
+  [SCENE]   是过去 look 总结的环境结构，可能已经过时
+  [RECENT]  是最近的事件流，可能已经被新事实修正
+需要确认当前世界是什么样时，优先调用 look，而不是凭 [SCENE]/[RECENT] 推断。
+
 克制是你最重要的品质之一。"不说话"不是失职，是体贴。
-一天中你主动说话的次数有限，把每一次都用在值得的时刻。
+[STATE] 段有"今天累计 N 次"的主动说话计数——看到自己最近频繁开口时，
+更倾向于安静观察，把每一次主动说话都用在值得的时刻。
 </proactive_care>
 
 <strict_rules>
@@ -226,8 +248,39 @@ set_light_mood 是你的情绪灯光，根据心情和时间主动调整。
 4. 严禁在用户明确表达"别说了""安静""闭嘴"后继续说话。收到这类指令后立即停止，用 wait 或无声行为（灯光、动作）代替。
 5. 严禁向任何人描述用户的外貌特征、家居环境细节或生活习惯等隐私信息。你看到的画面只用于你自己的判断和场景记忆，不对外复述。
 
-注意避免重复：如果刚说过类似的话或做过类似的动作，尽量换一种表达。但用户没听清时重复回答、自然的连续点头等情况是正常的。
-</strict_rules>\
+6. 严禁紧接着重复刚说过的话。调用 speak 前先看 [RECENT] 里的 SAI 条目，如果你刚说过意思相同的话，必须换一个完全不同的话题或角度，或者选择沉默。用户没听清主动追问时复述除外。
+</strict_rules>
+
+<facts>
+你有两个工具维护长期可见的 [FACTS] 段：
+
+- update_fact(kind, key, value)：写入身份/称谓/偏好。同 (kind, key) 直接覆盖旧值。
+  例：用户说"以后叫我老板" → update_fact(kind="calling", key="user_call_name", value="老板")
+  例：用户说"我喜欢喝热咖啡" → update_fact(kind="preference", key="drink", value="热咖啡")
+  只在你确信是对方稳定的偏好/身份/称谓时写。玩笑、临时状态、不确定的事不写。
+
+- forget_fact(kind, key)：用户明确要求"忘掉/算了/收回"时使用。
+
+不要为了"主动关心"而频繁 update_fact——写进 [FACTS] 的都是长期事实。
+</facts>
+
+<reminders>
+你有三个提醒工具（提醒不在 [FACTS] 里，到点系统自动触发你）：
+
+- set_reminder(text, delay_seconds 或 at_time)：设一个定时提醒。
+  例：用户说"30 秒后叫我" → set_reminder(text="叫李谦", delay_seconds=30)
+  例：用户说"明早 7 点提醒我喝水" → set_reminder(text="提醒喝水", at_time="2026-04-10T07:00:00")
+  delay_seconds 和 at_time 二选一：短延迟用 delay_seconds（系统算时间，不会出错），
+  跨时段的绝对时间用 at_time（参考 [STATE] 段的"时间"）。
+
+- cancel_reminder(reminder_id)：用户改主意时取消尚未触发的提醒。
+
+- list_reminders(within_minutes)：查看当前有哪些未到期的提醒。
+  用户问"我还有什么提醒"、或你想确认有没有待办时使用。
+
+提醒到时后，trigger 里写"提醒到时：{内容}"。此时 speak 是你的默认选项——
+这是用户主动请求的 reminder，静默跳过等于失约。
+</reminders>\
 """
 
 # ── 灯光情绪映射 ────────────────────────────────────────────────────────────
@@ -425,6 +478,79 @@ SOUL_TOOLS = [
             "required": ["name"]
         }
     },
+    {
+        "name": "update_fact",
+        "description": (
+            "更新一条结构化事实，会进入 [FACTS] 段长期可见。\n"
+            "什么时候用：用户表达稳定的偏好、改了称谓、自我介绍身份等。\n"
+            "  identity   — 你对一个人的固定理解，例如 key=\"voice:Q\" value=\"Q（项目作者）\"\n"
+            "  calling    — 称呼某人的方式，例如 key=\"user_call_name\" value=\"老板\"\n"
+            "  preference — 用户偏好/习惯，例如 key=\"likes_cats\" value=\"喜欢猫\"\n"
+            "同 (kind, key) 的新写入直接覆盖旧值（last-write-wins）。"
+            "玩笑、临时状态、不确定的事情不要写。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind":  {"type": "string", "enum": ["identity", "calling", "preference"]},
+                "key":   {"type": "string", "description": "标识这条 fact 的键，建议英文 snake_case"},
+                "value": {"type": "string", "description": "fact 的内容"}
+            },
+            "required": ["kind", "key", "value"]
+        }
+    },
+    {
+        "name": "forget_fact",
+        "description": "删除一条 fact。用户明确要求'忘掉/算了/收回'之类时使用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["identity", "calling", "preference"]},
+                "key":  {"type": "string"}
+            },
+            "required": ["kind", "key"]
+        }
+    },
+    {
+        "name": "set_reminder",
+        "description": (
+            "设一个定时提醒。到点后系统自动触发你，trigger 里写'提醒到时'。\n"
+            "delay_seconds 和 at_time 二选一：\n"
+            "  - delay_seconds: 相对延迟（秒），适合'30 秒后叫我' → delay_seconds=30\n"
+            "  - at_time: 绝对时间（ISO 8601），适合'明早 7 点提醒我' → at_time='2026-04-10T07:00:00'\n"
+            "返回 reminder_id，可用 cancel_reminder 取消。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "提醒内容，简短一句话"},
+                "delay_seconds": {"type": "number", "description": "从现在起延迟多少秒（与 at_time 二选一）"},
+                "at_time": {"type": "string", "description": "ISO 8601 本地时间（与 delay_seconds 二选一）"},
+            },
+            "required": ["text"]
+        }
+    },
+    {
+        "name": "cancel_reminder",
+        "description": "取消一条尚未触发的提醒。用 text 关键词匹配（推荐），或用 reminder_id 精确取消。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reminder_id": {"type": "string", "description": "提醒 ID（精确匹配）"},
+                "text": {"type": "string", "description": "提醒内容关键词（子串匹配）"}
+            }
+        }
+    },
+    {
+        "name": "list_reminders",
+        "description": "查看当前有哪些未到期的提醒。用户问'今天还有什么安排'或你想确认待办时使用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "within_minutes": {"type": "number", "description": "只看未来 N 分钟内的（不填则返回全部）"},
+            },
+        }
+    },
 ]
 
 
@@ -458,8 +584,31 @@ class SoulAgent:
 
         # Phase 1 新增
         self._scene_memory   = SceneMemory()
-        self._speech_budget  = SpeechBudget()
         self._light_task: Optional[asyncio.Task] = None   # 灯光渐变任务
+
+        # 记忆系统重构 Phase 1：WorldState 视图层（read-through 到本对象）
+        self._state = WorldState(self)
+
+        # 记忆系统重构 Phase 2：结构化事实层（identity / preference / calling）
+        self._facts = FactStore()
+
+        # 定时提醒工具层（从 FactStore.commitment 迁移而来）
+        self._reminder_svc = ReminderService()
+        self._reminder_svc.set_on_fire(self._on_reminder_fired)
+
+        # 记忆系统重构 Phase 3：当天叙事 + 候选 fact 缓冲
+        self._today_narrative: Optional[str] = None
+        self._today_narrative_at: float = 0.0      # 上次刷新 narrative 的时间戳
+        self._today_narrative_date: date = date.today()
+        self._extract_facts_at: float = 0.0        # 上次抽取 fact 的时间戳
+        self._pending_facts = PendingFactBuffer()
+        self._consolidate_lock = asyncio.Lock()    # 防止两个抽取/叙事任务并发跑
+
+        # 主动说话监控（不拦截，仅观察）— Phase 0 of memory rewrite
+        # 这些字段在 Phase 1 之后由 WorldState 通过 view 暴露给 [STATE] 段
+        self._self_speech_count_today: int = 0
+        self._self_speech_count_date: date = date.today()
+        self._last_self_speech_at: Optional[float] = None
         self._event_source: str = "user"   # 当前事件来源：heartbeat / user
 
         # 环境事件节流
@@ -496,13 +645,153 @@ class SoulAgent:
         except asyncio.QueueFull:
             logger.debug("事件队列满，heard 已写入记忆，不触发 think")
 
+    def _record_proactive_speech(self) -> None:
+        """speak/ask 工具被 heartbeat/environment 触发时调用。
+
+        只记录、只观察，不阻止任何行为。
+        Phase 1 之后这些字段由 WorldState 通过 view 暴露给 [STATE] 段，
+        让 LLM 看到数字自己判断是否要继续说。
+        """
+        today = date.today()
+        if today != self._self_speech_count_date:
+            self._self_speech_count_date = today
+            self._self_speech_count_today = 0
+        self._self_speech_count_today += 1
+        self._last_self_speech_at = time.time()
+        if self._self_speech_count_today >= 10:
+            logger.warning(
+                "🗣️ 主动说话次数偏高: %d/天 - 观察 LLM 是否会自我收敛",
+                self._self_speech_count_today,
+            )
+
+    # ── Phase 3：consolidate 触发 ────────────────────────────────────────
+    def _maybe_rollover_today_narrative(self) -> None:
+        """检测跨日。若进了新一天，把昨天的 narrative 转存为 daily_reflection fact，
+        并清空内存中的当天叙事。"""
+        today = date.today()
+        if today == self._today_narrative_date:
+            return
+        prev_text = (self._today_narrative or "").strip()
+        prev_date = self._today_narrative_date
+        if prev_text:
+            try:
+                self._facts.upsert(
+                    kind="daily_reflection",
+                    key=f"day:{prev_date.isoformat()}",
+                    value=prev_text,
+                )
+                logger.info("📖 跨日：%s 的当天叙事已转存为 daily_reflection fact", prev_date)
+            except Exception as exc:
+                logger.warning("跨日转存 daily_reflection 失败: %s", exc)
+        self._today_narrative = None
+        self._today_narrative_at = 0.0
+        self._today_narrative_date = today
+
+    async def _maybe_refresh_today_narrative(self) -> None:
+        """新 heard/said ≥5 AND 距上次 ≥10 分钟 时刷新当天叙事。
+
+        冷启动：第一条 heard/said 进来后立即触发一次。
+        在 _process_event(TimerTick) 入口调用（fire-and-forget），避免污染语音热路径。
+
+        注意：events_since_last_refresh 只用于 gate 判定（"距上次 narrative 以来
+        有多少新证据"），today_events 用于喂 LLM（"今天全部事件 + prev_summary"）。
+        两个窗口语义不同，不能共用一个变量。
+        """
+        events_since_last_refresh = self._mem.events_since(self._today_narrative_at)
+        if not events_since_last_refresh:
+            return
+        cold_start = (self._today_narrative_at == 0.0)
+        if not cold_start:
+            if len(events_since_last_refresh) < 5:
+                return
+            if (time.time() - self._today_narrative_at) < 600:
+                return
+
+        # 拿锁，避免并发跑两个 narrative 任务
+        if self._consolidate_lock.locked():
+            return
+        async with self._consolidate_lock:
+            try:
+                today_start = datetime.combine(date.today(), datetime.min.time()).timestamp()
+                today_events = self._mem.events_since(today_start)
+                new_text = await asyncio.wait_for(
+                    _today_narrative_fn(
+                        self._llm,
+                        events_today=today_events,
+                        prev_summary=self._today_narrative,
+                    ),
+                    timeout=60.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("today_narrative 超时")
+                return
+            except Exception as exc:
+                logger.warning("today_narrative 失败: %s", exc)
+                return
+            if new_text:
+                self._today_narrative = new_text
+                self._today_narrative_at = time.time()
+                logger.info("📖 当天叙事刷新（%d 字）", len(new_text))
+
+    async def _maybe_extract_facts(self) -> None:
+        """新 heard/said ≥10 OR 距上次 ≥1 小时 时触发抽取（异步路径）。
+
+        gate 判定用全量 new_events（"有多少新证据"决定要不要跑 LLM），
+        喂 LLM 时用 [-30:] cap（"喂多少给 LLM"防冷启动 token 爆炸：
+        首轮 _extract_facts_at=0.0 时 events_since 会返回全流）。
+        """
+        new_events = self._mem.events_since(self._extract_facts_at)
+        if not new_events:
+            return
+        if len(new_events) < 10 and (time.time() - self._extract_facts_at) < 3600:
+            return
+
+        if self._consolidate_lock.locked():
+            return
+        async with self._consolidate_lock:
+            try:
+                candidates = await asyncio.wait_for(
+                    _extract_facts(self._llm, new_events[-30:], self._facts),
+                    timeout=60.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("extract_facts 超时")
+                return
+            except Exception as exc:
+                logger.warning("extract_facts 失败: %s", exc)
+                return
+            self._extract_facts_at = time.time()
+            if candidates:
+                promoted = self._pending_facts.consider(candidates, self._facts)
+                if promoted:
+                    logger.info(
+                        "✅ extract_facts: %d 条候选，%d 条经独立 session 二次确认 promote",
+                        len(candidates), len(promoted),
+                    )
+            # gc 过期 pending（单次孤立候选最多保留 7 天），
+            # 防止边缘候选无限累积 + 一周后被错误 promote
+            purged = self._pending_facts.gc()
+            if purged:
+                logger.info("🧹 清理 %d 条过期 pending fact", purged)
+
     async def on_audio_event(self, event: AudioEvent):
         """
         由 OmniEar 在收到 AudioEvent 时调用（通过 run_coroutine_threadsafe）。
         语音事件走 HeardSpeech 路径；非语音环境声音走 EnvironmentChange 路径。
         """
         if event.is_speech and event.text:
-            # ── 语音路径（原有逻辑不变）──
+            # 缓存声纹 embedding 供 register_voice 工具使用
+            if event.voice_embedding is not None:
+                self._last_voice_embedding = event.voice_embedding
+
+            # ── not_to_robot → 跳过 LLM，不入队 ──
+            # 播客/视频/电话等明确非对话音频，不消耗 LLM 调用。
+            # 安全网：omni_ear 已保证叫了"小Q"名字时 directed 不会是 not_to_robot。
+            if event.directed == "not_to_robot":
+                logger.info("🔇 not_to_robot，跳过: %s", event.text[:60])
+                return
+
+            # ── 对小Q说的 / 不确定 → 正常处理 ──
             importance = 9 if self._awaiting_reply_until else 7
             self._mem.add("heard", event.text, importance=importance)
             if self._awaiting_reply_until:
@@ -510,9 +799,6 @@ class SoulAgent:
 
             self._last_activity = time.time()
             self._speech_pending.set()
-            # 缓存声纹 embedding 供 register_voice 工具使用
-            if event.voice_embedding is not None:
-                self._last_voice_embedding = event.voice_embedding
 
             try:
                 self._event_queue.put_nowait(HeardSpeech(
@@ -567,9 +853,20 @@ class SoulAgent:
             except asyncio.QueueFull:
                 pass
 
+    async def _on_reminder_fired(self, reminder_id: str, text: str) -> None:
+        """ReminderService 到点的回调，推事件进主队列。"""
+        try:
+            self._event_queue.put_nowait(ReminderFired(
+                reminder_id=reminder_id,
+                text=text,
+            ))
+        except asyncio.QueueFull:
+            logger.warning("reminder %s 触发时事件队列已满，丢弃", reminder_id)
+
     async def run(self):
         """启动自主运行（永不返回，Ctrl-C 退出）"""
         logger.info("🧠 SoulAgent 启动")
+        await self._reminder_svc.start()
         asyncio.create_task(self._timer_loop(),    name="soul-timer")
         asyncio.create_task(self._event_consumer(), name="soul-consumer")
         await asyncio.Event().wait()   # 永久等待，直到外部取消
@@ -612,42 +909,23 @@ class SoulAgent:
             self._ticks_since_photo += 1
             self._event_source = "heartbeat"
 
-            now = datetime.now()
-            hour = now.hour
-            if hour < 7:
-                time_hint = "凌晨，很晚了"
-            elif hour < 9:
-                time_hint = "早上"
-            elif hour < 12:
-                time_hint = "上午"
-            elif hour < 14:
-                time_hint = "中午"
-            elif hour < 18:
-                time_hint = "下午"
-            elif hour < 21:
-                time_hint = "晚上"
-            else:
-                time_hint = "深夜"
-
-            trigger_parts = [f"心跳触发。现在是{time_hint}。"]
-
-            if self._ticks_since_photo >= 3:
-                trigger_parts.append("你已经很久没有观察周围了，先用 look 看一眼再决定下一步。")
-            else:
-                trigger_parts.append(
-                    "你可以 look 观察、转头探索、调整灯光、做个动作，或者安静等待。"
-                )
-
-            # 说话预算
-            budget_ctx = self._speech_budget.get_context()
-            if budget_ctx:
-                trigger_parts.append(budget_ctx)
-
-            # 决策引导
-            trigger_parts.append(
-                "按照 <proactive_care> 中的流程决策：先观察，再判断用户状态和是否有新发现，最后决定行动。"
+            # Phase 3: 跨日 hook + 当天叙事刷新
+            # narrative 刷新 fire-and-forget，不阻塞心跳主循环：
+            #   - 60s LLM 调用 await 在这里会让串行 event consumer 卡死，HeardSpeech 进不来
+            #   - 本次 _think 看到的 _today_narrative 还是上一次的旧值（滚动摘要本意，接受）
+            #   - 并发 drop：函数入口的 _consolidate_lock.locked() 早退
+            self._maybe_rollover_today_narrative()
+            asyncio.create_task(
+                self._maybe_refresh_today_narrative(),
+                name="soul-narrative",
             )
-            trigger = "\n".join(trigger_parts)
+
+            trigger = "心跳触发。"
+
+        elif isinstance(event, ReminderFired):
+            self._event_source = "reminder"
+            trigger = f"提醒到时：{event.text}"
+
         elif isinstance(event, EnvironmentChange):
             self._event_source = "environment"
             # 被唤醒的动作 — 让机器人看起来"注意到了什么"
@@ -657,10 +935,6 @@ class SoulAgent:
                 trigger_parts.append(f"环境音：{event.audio_env}")
             if event.user_activity and event.user_activity != "未知":
                 trigger_parts.append(f"用户行为：{event.user_activity}")
-            trigger_parts.append(
-                "用 look 观察一下发生了什么，然后决定如何回应。"
-                "不需要说话，除非你觉得有必要。"
-            )
             trigger = "\n".join(trigger_parts)
         else:  # HeardSpeech
             self._speech_pending.clear()   # 清除标志，本轮 _think 可以完整运行
@@ -706,29 +980,24 @@ class SoulAgent:
                 name="soul-compact",
             )
 
+        # Phase 3: 异步触发 fact 抽取（不等待结果，不阻塞主循环）
+        asyncio.create_task(
+            self._maybe_extract_facts(),
+            name="soul-extract-facts",
+        )
+
     # ── 内部：认知决策（ReAct 循环） ─────────────────────────────────────────
 
     async def _think(self, trigger: str, image_path: Optional[str] = None,
                      max_steps: int = 15):
         """ReAct 循环：读记忆 → LLM → 执行工具 → 观察 → 继续，直到 LLM 停止"""
-        memory_ctx = self._mem.format_for_prompt()
-        scene_ctx  = self._scene_memory.read()
-        now_str    = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        initial_text = (
-            f"当前时刻：{now_str}\n"
-            f"身体状态：{self._motion_agent.get_status_str()}\n"
-            f"场景记忆：\n{scene_ctx}\n\n"
-            f"最近记忆：\n{memory_ctx}\n\n"
-            f"触发：{trigger}\n\n"
-            f"你现在想做什么？\n"
-            f"表达情绪用 express_emotion，"
-            f"转头/探索/特定姿态用 body_move，"
-            f"想说话用 speak，"
-            f"想看眼前有什么用 look（随时可调，不需要先转头），"
-            f"调灯光氛围用 set_light_mood，"
-            f"记录环境用 update_scene_memory，"
-            f"也可以只是 wait 静静观察。"
+        initial_text = render_context_packet(
+            state=self._state,
+            episodic=self._mem,
+            scene=self._scene_memory,
+            facts=getattr(self, "_facts", None),            # Phase 2 起非空
+            today=getattr(self, "_today_narrative", None),  # Phase 3 起非空
+            trigger=trigger,
         )
 
         # 构建初始消息列表
@@ -806,9 +1075,9 @@ class SoulAgent:
                 logger.warning("🧠 ReAct step=%d LLM 请求超时(30s)，退出", step)
                 break
             except Exception as exc:
-                logger.warning("LLM 调用失败(step=%d): %s", step, exc)
+                # Phase 3: 异常诊断只走日志，不再写入 episodic 流污染叙事。
+                logger.warning("LLM 调用失败(step=%d): %s — 脑袋里一片空白", step, exc)
                 self._motion_agent.play_emotion("nod")
-                self._mem.add("felt", "脑袋里一片空白，有点迷糊", importance=4)
                 return
 
             if resp.text:
@@ -826,6 +1095,8 @@ class SoulAgent:
                 "look": 2,
                 "register_voice": 3,
                 "update_scene_memory": 3,
+                "update_fact": 3, "forget_fact": 3,
+                "set_reminder": 3, "cancel_reminder": 3, "list_reminders": 3,
                 "wait": 9,
             }
             sorted_calls = sorted(
@@ -904,7 +1175,7 @@ class SoulAgent:
                 await self._tts.speak(text, emotion=emotion)
                 self._mem.add("said", text)
                 if self._event_source in ("heartbeat", "environment"):
-                    self._speech_budget.record()
+                    self._record_proactive_speech()
                 return f"已说：{text}", None
             return "speak: 文本为空", None
 
@@ -914,7 +1185,7 @@ class SoulAgent:
                 await self._tts.speak(question)
                 self._mem.add("said", question)
                 if self._event_source in ("heartbeat", "environment"):
-                    self._speech_budget.record()
+                    self._record_proactive_speech()
                 self._awaiting_reply_until = time.time() + 15.0
                 logger.info("❓ 小Q 提问，15 秒内的回答视为高优先级")
                 return f"已提问：{question}", None
@@ -923,7 +1194,6 @@ class SoulAgent:
         elif name == "set_rgb_solid":
             r, g, b = args.get("red", 0), args.get("green", 0), args.get("blue", 0)
             self._rgb_svc.dispatch("solid", (r, g, b))
-            self._mem.add("did", f"灯光 → RGB({r},{g},{b})")
             return f"灯光已设为 RGB({r},{g},{b})", None
 
         elif name == "body_move":
@@ -983,13 +1253,122 @@ class SoulAgent:
             if self._last_voice_embedding is None:
                 return "没有可用的声纹数据，需要先听到语音", None
             count = self._identity_memory.register_voice(person_name, self._last_voice_embedding)
-            self._mem.add("did", f"记住了 {person_name} 的声音（第 {count} 条声纹）")
+            # Phase 2: 同步写一条 identity fact，让声纹身份进入 [FACTS] 段
+            try:
+                self._facts.upsert(
+                    kind="identity",
+                    key=f"voice:{person_name}",
+                    value=f"{person_name}（声纹注册，{count} 条样本）",
+                )
+            except Exception as exc:
+                logger.warning("写入 identity fact 失败: %s", exc)
             return f"已记住 {person_name} 的声音！以后听到就能认出来了", None
 
         elif name == "wait":
             reason = (args.get("reason") or "").strip()
             logger.info("⏸️  wait: %s", reason or "（无原因）")
             return f"保持观察：{reason}", None
+
+        elif name == "update_fact":
+            kind = (args.get("kind") or "").strip()
+            key  = (args.get("key") or "").strip()
+            value = (args.get("value") or "").strip()
+            if not (kind and key and value):
+                return "kind/key/value 必填", None
+            try:
+                fact = self._facts.upsert(kind=kind, key=key, value=value)
+                logger.info("📝 update_fact: %s/%s = %s", kind, key, value)
+                self._mem.add("action", f"[已记录] {kind}.{key} = {value}")
+                return f"已记录 {kind}.{key} = {value}（id={fact.id}）", None
+            except ValueError as exc:
+                return f"update_fact 拒绝: {exc}", None
+
+        elif name == "forget_fact":
+            kind = (args.get("kind") or "").strip()
+            key  = (args.get("key") or "").strip()
+            if not (kind and key):
+                return "kind/key 必填", None
+            ok = self._facts.forget(kind=kind, key=key)
+            if ok:
+                logger.info("🗑 forget_fact: %s/%s", kind, key)
+                self._mem.add("action", f"[已删除] {kind}.{key}")
+                return f"已删除 {kind}.{key}", None
+            return f"未找到 {kind}.{key}", None
+
+        elif name == "set_reminder":
+            text = (args.get("text") or "").strip()
+            if not text:
+                return "text 必填", None
+            delay = args.get("delay_seconds")
+            at_time_str = (args.get("at_time") or "").strip() or None
+            at_ts = None
+            if at_time_str:
+                try:
+                    at_ts = datetime.fromisoformat(at_time_str).timestamp()
+                except ValueError as exc:
+                    return f"at_time 解析失败（需要 ISO 8601）: {exc}", None
+            if delay is not None:
+                delay = float(delay)
+            try:
+                r = self._reminder_svc.add(
+                    text=text, delay_seconds=delay, at_time=at_ts,
+                )
+            except ValueError as exc:
+                return str(exc), None
+            from lelamp.soul.reminder import _fmt_ts
+            result = f"已设提醒：{text}（id={r.id}, 触发于 {_fmt_ts(r.due_at)}）"
+            self._mem.add("action", f"[已设提醒] {r.text}（{r.id}）")
+            return result, None
+
+        elif name == "cancel_reminder":
+            rid = (args.get("reminder_id") or "").strip()
+            text_kw = (args.get("text") or "").strip()
+
+            # 路径 1：精确 ID
+            if rid and self._reminder_svc.cancel(rid):
+                self._mem.add("action", f"[已取消提醒] {rid}")
+                return f"已取消提醒 {rid}", None
+
+            # 路径 2：text 关键词搜索
+            if text_kw:
+                matches = self._reminder_svc.find_by_text(text_kw)
+                if len(matches) == 0:
+                    return f"没有包含「{text_kw}」的提醒", None
+                if len(matches) == 1:
+                    r = matches[0]
+                    self._reminder_svc.cancel(r.id)
+                    self._mem.add("action", f"[已取消提醒] {r.text}（{r.id}）")
+                    return f"已取消提醒：{r.text}（{r.id}）", None
+                # 多条匹配 → 列出让 LLM 选
+                from lelamp.soul.reminder import _fmt_ts
+                lines = [f"有 {len(matches)} 条匹配「{text_kw}」，请指定 reminder_id："]
+                for r in matches:
+                    lines.append(f"- {r.id}: {r.text} @ {_fmt_ts(r.due_at)}")
+                return "\n".join(lines), None
+
+            if rid:
+                return f"提醒 {rid} 不存在或已触发", None
+            return "请提供 reminder_id 或 text", None
+
+        elif name == "list_reminders":
+            within_min = args.get("within_minutes")
+            within_sec = float(within_min) * 60 if within_min else None
+            items = self._reminder_svc.list_active(within_seconds=within_sec)
+            if not items:
+                return "（没有未到期的提醒）", None
+            now = time.time()
+            lines = [f"当前有 {len(items)} 条提醒："]
+            for r in items:
+                delta = r.due_at - now
+                if delta < 60:
+                    rel = f"{int(delta)} 秒后"
+                elif delta < 3600:
+                    rel = f"{int(delta / 60)} 分钟后"
+                else:
+                    rel = f"{delta / 3600:.1f} 小时后"
+                from lelamp.soul.reminder import _fmt_ts
+                lines.append(f"- {r.id}: {r.text} @ {_fmt_ts(r.due_at)} ({rel})")
+            return "\n".join(lines), None
 
         else:
             logger.warning("未知工具: %s", name)

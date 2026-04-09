@@ -31,8 +31,7 @@ from lelamp.agent.ai_client import AIClient
 from lelamp.motion.motion_agent import MotionAgent
 from lelamp.service.rgb.rgb_service import RGBService
 from lelamp.soul.camera_capture import CameraCapture
-from lelamp.soul.identity_memory import IdentityMemory
-from lelamp.soul.memory_stream import MemoryStream
+from lelamp.soul.memory import IdentityMemory, MemoryStream
 from lelamp.soul.omni_ear import OmniEar
 from lelamp.soul.soul_agent import SoulAgent
 from lelamp.tts.doubao_speaker import DoubaoTTSPlayer
@@ -145,7 +144,6 @@ async def main():
 
     await ear.start()
     await tts.speak("呼——我醒来了。")
-    mem.add("felt", "刚刚启动，世界感觉是新鲜的", importance=6)
 
     logger.info("小Q 智能耳朵系统已启动（Ctrl-C 退出）")
 

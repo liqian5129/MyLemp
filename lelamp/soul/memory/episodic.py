@@ -41,23 +41,41 @@ _IMPORTANCE_KEYWORDS = [
     "名字", "出门", "回来", "一起", "好吗", "可以", "走了",
 ]
 
+# Phase 3: episodic 收紧到 heard/said/thought/action。
+# thought 是内部 compaction 写入的反思条目，不属于"事件"但留在流里作为叙事压缩产物。
+# action 是工具执行记录（set_reminder/cancel_reminder 等），与 heard/said 同权进保底槽位。
+# 其他类型（did/saw/felt）一律拒绝。
+ALLOWED_TYPES = {"heard", "said", "thought", "action"}
+
 
 @dataclass
 class MemoryEntry:
     id: str
     timestamp: float
-    type: str           # heard | saw | said | did | felt | thought
+    type: str           # heard | said | thought | action
     content: str
     importance: float   # 1-10
     archived: bool = False
 
 
+def _format_relative(seconds_ago: float) -> str:
+    """把秒差转成"X 秒前 / X 分钟前 / X 小时前 / X 天前"。"""
+    s = max(0.0, seconds_ago)
+    if s < 60:
+        return f"{int(s)} 秒前"
+    if s < 3600:
+        return f"{int(s / 60)} 分钟前"
+    if s < 86400:
+        return f"{int(s / 3600)} 小时前"
+    return f"{int(s / 86400)} 天前"
+
+
 def _score_importance(type_: str, content: str) -> float:
-    """基于类型 + 简单启发式计算重要性（无需 LLM）"""
-    base = {
-        "heard": 6, "saw": 4, "said": 6,
-        "did": 3, "felt": 5, "thought": 6,
-    }.get(type_, 5)
+    """基于类型 + 简单启发式计算重要性（无需 LLM）。
+
+    Phase 3 收紧后只对 heard/said 评分；thought 由 compaction 显式传入 importance。
+    """
+    base = {"heard": 6, "said": 6, "action": 7}.get(type_, 5)
     if type_ == "heard":
         if len(content) > 20:
             base += 1
@@ -108,7 +126,15 @@ class MemoryStream:
         content: str,
         importance: Optional[float] = None,
     ) -> MemoryEntry:
-        """添加一条记忆，通知后台防抖写盘（不阻塞调用方）。"""
+        """添加一条记忆，通知后台防抖写盘（不阻塞调用方）。
+
+        Phase 3：只接受 heard/said/thought。其他类型（did/saw/felt）一律拒绝，
+        从源头杜绝事件流被状态/控制信号污染。
+        """
+        if type_ not in ALLOWED_TYPES:
+            raise ValueError(
+                f"episodic 不接受类型 {type_!r}（允许: {sorted(ALLOWED_TYPES)}）"
+            )
         entry = MemoryEntry(
             id=str(uuid.uuid4())[:8],
             timestamp=time.time(),
@@ -152,12 +178,12 @@ class MemoryStream:
 
     def format_for_prompt(self) -> str:
         """
-        紧凑格式，带日期和会话间隔分隔。
+        紧凑格式，带日期、会话间隔分隔和"距今 X 分钟前"相对时间。
         示例：
-          [03-30 21:15 HEA] 有人说：小Q 你好
+          [03-30 21:15 HEA · 18 小时前] 有人说：小Q 你好
           --- (间隔 12 小时) ---
-          [09:15 HEA] 早上好
-          [09:15 SAI] 哒！早上好！
+          [09:15 HEA · 5 分钟前] 早上好
+          [09:15 SAI · 5 分钟前] 哒！早上好！
         """
         entries = self.retrieve()
         if not entries:
@@ -165,6 +191,7 @@ class MemoryStream:
 
         lines = []
         today = datetime.now().date()
+        now = time.time()
         prev_ts = None
 
         for e in sorted(entries, key=lambda x: x.timestamp):
@@ -185,13 +212,28 @@ class MemoryStream:
                 t = dt.strftime("%m-%d %H:%M")
 
             tag = e.type[:3].upper()
-            lines.append(f"[{t} {tag}] {e.content}")
+            rel = _format_relative(now - e.timestamp)
+            lines.append(f"[{t} {tag} · {rel}] {e.content}")
             prev_ts = e.timestamp
 
         return "\n".join(lines)
 
     def should_compact(self) -> bool:
         return sum(1 for e in self._entries if not e.archived) > COMPACT_THRESHOLD
+
+    def events_since(
+        self,
+        ts: float,
+        types: Optional[set[str]] = None,
+    ) -> List[MemoryEntry]:
+        """返回 timestamp > ts 的活跃事件。types 默认 {heard, said}。"""
+        types = types if types is not None else {"heard", "said"}
+        return [
+            e for e in self._entries
+            if not e.archived
+            and e.timestamp > ts
+            and e.type in types
+        ]
 
     async def compact_if_needed(self, llm) -> None:
         """压缩旧记忆为 reflection 条目。并发安全，重复调用无害。"""
@@ -217,7 +259,7 @@ class MemoryStream:
             for e in self._entries:
                 if e.id in ids_to_compact:
                     e.archived = True
-            self.add("thought", summary, importance=6)
+            self.add("thought", summary, importance=5)
             await asyncio.to_thread(self._flush_sync)
             self._append_to_archive(to_compact)
             logger.info("✅ 记忆压缩完成，归档 %d 条", len(to_compact))
@@ -276,18 +318,32 @@ class MemoryStream:
             logger.warning("写 archive 失败: %s", exc)
 
 
+_TYPE_LABEL_ZH = {
+    "heard": "用户说",
+    "said": "我说",
+    "thought": "总结",
+}
+
+
 async def _summarize(llm, entries: List[MemoryEntry]) -> str:
-    """用 LLM 将一批记忆总结为一条 thought"""
+    """用 LLM 将一批记忆总结为一条 thought（叙事压缩，留在 episodic 流）。
+
+    Phase 3 改进：
+    - 字数 80 → 150
+    - 类型翻译为自然语言（heard → "用户说"，said → "我说"）
+    """
     lines = []
     for e in sorted(entries, key=lambda x: x.timestamp):
         t = datetime.fromtimestamp(e.timestamp).strftime("%H:%M")
-        lines.append(f"[{t}] {e.type}: {e.content}")
+        label = _TYPE_LABEL_ZH.get(e.type, e.type)
+        lines.append(f"[{t}] {label}: {e.content}")
     bulk = "\n".join(lines)
 
     resp = await llm.chat(
         user_message=(
-            f"以下是小Q 最近的部分记忆记录，请用 1-2 句话总结发生了什么：\n{bulk}"
+            f"以下是小Q 最近的部分对话记录，请用 2-3 句话总结这一段时间里发生了什么、"
+            f"对话主题、用户和小Q 的状态：\n{bulk}"
         ),
-        system_prompt="你是记忆整理助手，用简短中文总结。不超过 80 字，不加任何前缀。",
+        system_prompt="你是记忆整理助手，用简短中文叙事性总结。不超过 150 字，不加任何前缀。",
     )
     return (resp.text or "").strip() or "（一段时光悄悄过去了）"
