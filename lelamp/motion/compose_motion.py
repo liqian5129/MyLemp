@@ -13,10 +13,10 @@ from typing import Optional
 
 VALID_JOINTS = {"base_yaw", "base_pitch", "elbow_pitch", "wrist_roll", "wrist_pitch"}
 MIN_SEG_COUNT = 2
-MAX_SEG_COUNT = 8
+MAX_SEG_COUNT = 12
 MIN_DUR       = 0.15
 MAX_DUR       = 2.0
-MAX_TOTAL_DUR = 6.0
+MAX_TOTAL_DUR = 8.0
 JOINT_RANGE   = (-92.0, 92.0)
 
 
@@ -143,7 +143,7 @@ segments:
    - 中幅度（30-50°）：0.5-0.8s
    - 大幅度（>50°）：0.8-1.2s
    ⚠️ 角度变化大但 duration 太短会被速度安全网强制拉伸，动作会比预期慢且失去节奏感。
-   总时长不超过 5s
+   总时长不超过 8s（多阶段串联表演可用满）
 5. 只写要变的关节，未指定的关节自动维持上一段的值
 6. intent 字段必填，写出关节级的动作分解（见各示例的 intent 写法）
 7. intent 要写机械分解：点名用哪几个关节、运动模式（摆动/脉冲/渐变/弹跳）、节奏（快慢/停顿），不要只写诗意描述

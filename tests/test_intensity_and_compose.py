@@ -167,7 +167,7 @@ def test_validate_out_of_range_duration():
 
 
 def test_validate_total_duration():
-    seg = [{"joints": {"wrist_pitch": -47}, "duration": 1.5}] * 5  # 7.5s 总时长
+    seg = [{"joints": {"wrist_pitch": -47}, "duration": 2.0}] * 5  # 10.0s 总时长
     _, err = validate_segments(seg)
     assert err and "总时长" in err
     _passed(f"拒绝总时长 > {MAX_TOTAL_DUR}s")
