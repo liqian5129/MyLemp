@@ -11,6 +11,9 @@
     KIMI_API_KEY           必填  — SoulAgent LLM
     KIMI_MODEL             可选，默认 kimi-k2.5
     DASHSCOPE_API_KEY      必填  — Qwen Omni HTTP
+    EMBEDDING_API_KEY      可选  — 长期记忆向量搜索（DashScope text-embedding-v4）
+    REVIEW_LLM_API_KEY     可选  — Background Review 独立 API key（默认复用主 LLM key）
+    REVIEW_LLM_MODEL       可选  — Background Review 模型（默认同主 LLM）
     DOUBAO_TTS_APPID       必填
     DOUBAO_TTS_TOKEN       必填
     DOUBAO_TTS_CLUSTER     可选，默认 volcano_tts
@@ -31,7 +34,7 @@ from lelamp.agent.ai_client import AIClient
 from lelamp.motion.motion_agent import MotionAgent
 from lelamp.service.rgb.rgb_service import RGBService
 from lelamp.soul.camera_capture import CameraCapture
-from lelamp.soul.memory import IdentityMemory, MemoryStream
+from lelamp.soul.memory import HistoryDB, IdentityMemory, MemoryStream, LongTermMemory
 from lelamp.soul.omni_ear import OmniEar
 from lelamp.soul.soul_agent import SoulAgent
 from lelamp.tts.doubao_speaker import DoubaoTTSPlayer
@@ -80,6 +83,40 @@ async def main():
     else:
         raise ValueError(f"不支持的 LLM_PROVIDER: {llm_provider}")
 
+    # ── Background Review LLM 客户端（独立，不阻塞主对话）───────────────────────
+    # 默认交叉 provider：主 qwen → review kimi，主 kimi → review qwen
+    review_api_key = os.environ.get("REVIEW_LLM_API_KEY", "")
+    if review_api_key:
+        # 显式指定 → 沿用主 provider
+        review_llm = AIClient(
+            provider=llm_provider,
+            api_key=review_api_key,
+            model=os.environ.get("REVIEW_LLM_MODEL", llm.model),
+            base_url=llm.base_url,
+        )
+    elif llm_provider == "qwen" and os.environ.get("KIMI_API_KEY"):
+        review_llm = AIClient(
+            provider="kimi",
+            api_key=os.environ["KIMI_API_KEY"],
+            model=os.environ.get("REVIEW_LLM_MODEL", "kimi-k2.5"),
+            base_url="https://api.moonshot.cn/v1",
+        )
+    elif llm_provider == "kimi" and os.environ.get("QWEN_API_KEY"):
+        review_llm = AIClient(
+            provider="qwen",
+            api_key=os.environ["QWEN_API_KEY"],
+            model=os.environ.get("REVIEW_LLM_MODEL", "qwen3.6-plus"),
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+    else:
+        # 兜底：复用主 LLM
+        review_llm = AIClient(
+            provider=llm_provider,
+            api_key=llm.api_key,
+            model=llm.model,
+            base_url=llm.base_url,
+        ) if llm.api_key else None
+
     # ── 运动服务 ──────────────────────────────────────────────────────────────
     motion_svc = MotionAgent(port=port, lamp_id="lelamp", fps=30)
     motion_svc.start()
@@ -113,9 +150,21 @@ async def main():
 
     # ── 身份识别 + 记忆 + 智能体 ────────────────────────────────────────────────
     identity_mem = IdentityMemory()
-    mem = MemoryStream()
+
+    # SQLite 会话历史（首次启动时迁移旧 archive）
+    history_db = HistoryDB()
+    archive_path = Path.home() / ".lelamp" / "memories.archive.json"
+    if archive_path.exists():
+        migrated = history_db.migrate_from_archive(archive_path)
+        if migrated > 0:
+            logger.info("📦 已迁移 %d 条历史到 SQLite", migrated)
+
+    mem = MemoryStream(history_db=history_db)
     mem.start()
-    agent = SoulAgent(motion_svc, rgb_svc, tts, mem, llm, identity_memory=identity_mem)
+    ltm = LongTermMemory(api_key=os.environ.get("EMBEDDING_API_KEY", ""))
+    agent = SoulAgent(motion_svc, rgb_svc, tts, mem, llm,
+                      identity_memory=identity_mem, longterm_memory=ltm,
+                      review_llm=review_llm, history_db=history_db)
 
     # ── 开机动作 ──────────────────────────────────────────────────────────────
     motion_svc.play_emotion("wake_up")
@@ -152,12 +201,14 @@ async def main():
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("收到退出信号")
     finally:
+        await agent.shutdown()
         camera.stop()
         await ear.stop()
         await tts.stop()
         motion_svc.stop_recording()
         motion_svc.stop()
         rgb_svc.stop()
+        history_db.close()
         logger.info("小Q 已休眠")
 
 

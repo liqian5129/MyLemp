@@ -280,17 +280,6 @@ class OmniEar:
                     voice_embedding=voice_emb,
                 )
 
-                # ── directed 修正：声纹 × 名字双重校验 ──
-                # 1. 叫了"小Q" → 无条件 to_robot
-                # 2. 没叫名字 + 已注册用户 + Qwen 判 to_robot → 保持
-                # 3. 没叫名字 + 未知说话人 + Qwen 判 to_robot → 降级 uncertain（防播客/视频）
-                _text_norm = event.text.lower().replace(" ", "")
-                if "小q" in _text_norm:
-                    event.directed = "to_robot"
-                elif event.directed == "to_robot" and event.speaker is None:
-                    logger.info("🔇 directed 降级: to_robot → uncertain（未知说话人，未叫名字）")
-                    event.directed = "uncertain"
-
                 logger.info(
                     "AudioEvent: text=%r emotion=%s intent=%s directed=%s env=%r activity=%r speaker=%s",
                     event.text, event.emotion, event.intent, event.directed,

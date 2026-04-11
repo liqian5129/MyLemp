@@ -104,6 +104,7 @@ def render_context_packet(
     scene: "SceneMemory",
     facts: Any = None,    # Phase 2 注入 FactStore
     today: Optional[str] = None,   # Phase 3 注入 today_narrative
+    ltm_hint: Optional[str] = None,  # 长期记忆摘要提示
     trigger: str = "",
 ) -> str:
     """构造 ReAct initial user message 的正文。
@@ -122,6 +123,15 @@ def render_context_packet(
         except AttributeError:
             facts_text = None
         sec = _render_section("FACTS", facts_text)
+        if sec:
+            sections.append(sec)
+
+    # [LONGTERM]  — 长期记忆摘要提示
+    if ltm_hint:
+        sec = _render_section(
+            "LONGTERM",
+            f"你的长期记忆库：{ltm_hint} — 用 recall_memory 搜索详情",
+        )
         if sec:
             sections.append(sec)
 

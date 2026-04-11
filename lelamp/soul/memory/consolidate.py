@@ -293,3 +293,99 @@ async def today_narrative(
         return prev_summary or ""
     text = (resp.text or "").strip()
     return text or (prev_summary or "")
+
+
+# ── extract_longterm_memories ────────────────────────────────────────────
+
+_LTM_EXTRACT_SYSTEM_PROMPT = """你是小Q 的长期记忆提取助手。从一段对话中找出值得永久记住的详细信息。
+
+提取标准——只提取用户分享的、长期有效的个人信息：
+- 爱好和兴趣的细节 → category=hobby
+- 明确的厌恶 → category=dislike
+- 个人经历、故事 → category=experience
+- 提到的人（家人、朋友、同事）→ category=person
+- 生活习惯 → category=habit
+- 目标、愿望、计划 → category=wish
+- 有趣的知识或观点 → category=knowledge
+
+不要提取：
+- 临时状态（"我有点累"、"今天很忙"）
+- 纯寒暄、打招呼
+- 小Q 自己的行为记录
+- 模糊不确定的信息
+
+严格输出 JSON 数组，每个元素：
+  {"category": "...", "title": "简短标题", "content": "详细描述", "tags": ["标签1", "标签2"]}
+
+没有值得提取的内容则返回 []。不要输出任何前后缀或 markdown。"""
+
+
+async def extract_longterm_memories(
+    llm,
+    entries: list["MemoryEntry"],
+    existing_ltm,
+    timeout: float = 60.0,
+) -> list[dict]:
+    """从待压缩的 episodic 条目中提取长期记忆候选。"""
+    dialogue = _events_to_dialogue(entries)
+    if not dialogue.strip():
+        return []
+
+    # 告知已有的长期记忆，避免重复提取
+    existing_titles = []
+    if existing_ltm is not None:
+        for e in existing_ltm._entries:
+            existing_titles.append(f"- [{e.category}] {e.title}")
+    existing_text = "\n".join(existing_titles) if existing_titles else "（暂无）"
+
+    user_msg = (
+        f"已有的长期记忆：\n{existing_text}\n\n"
+        f"对话记录：\n{dialogue}\n\n"
+        f"按标准提取值得永久记住的信息。已有的不要重复提取。"
+    )
+    try:
+        resp = await llm.chat(
+            user_message=user_msg,
+            system_prompt=_LTM_EXTRACT_SYSTEM_PROMPT,
+        )
+    except Exception as exc:
+        logger.warning("extract_longterm_memories LLM 调用失败: %s", exc)
+        return []
+
+    # 解析 JSON
+    text = (resp.text or "").strip()
+    m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning("extract_longterm_memories JSON 解析失败: %s", exc)
+        return []
+    if not isinstance(data, list):
+        return []
+
+    from .longterm import CATEGORIES
+    results = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        cat = (item.get("category") or "").strip()
+        title = (item.get("title") or "").strip()
+        content = (item.get("content") or "").strip()
+        if not (cat and title and content):
+            continue
+        if cat not in CATEGORIES:
+            cat = "other"
+        results.append({
+            "category": cat,
+            "title": title[:30],
+            "content": content[:500],
+            "tags": (item.get("tags") or [])[:5],
+        })
+
+    if results:
+        logger.info("📤 extract_longterm_memories 提取 %d 条长期记忆", len(results))
+    return results

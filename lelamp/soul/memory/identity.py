@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DIR = os.path.expanduser("~/.lelamp/identities")
 
 # 相似度阈值（余弦相似度，0-1）
-_VOICE_THRESHOLD = 0.75
+_VOICE_THRESHOLD = 0.65
 _FACE_THRESHOLD = 0.45
 
 
@@ -175,7 +175,19 @@ class IdentityMemory:
                     best_name = name
 
         if best_name:
-            logger.debug("身份匹配: %s (score=%.3f)", best_name, best_score)
+            logger.info("🔊 身份匹配: %s (score=%.3f, threshold=%.2f)", best_name, best_score, threshold)
+        else:
+            # 输出最高 score 帮助排查阈值问题
+            top_name = None
+            top_score = -1.0
+            for name, embs in db.items():
+                for ref in embs:
+                    score = _cosine_similarity(embedding, ref)
+                    if score > top_score:
+                        top_score = score
+                        top_name = name
+            if top_name is not None:
+                logger.info("🔇 身份未匹配: 最高 %s (score=%.3f, threshold=%.2f)", top_name, top_score, threshold)
         return best_name
 
     # ── 查询 ─────────────────────────────────────────────────────────────────

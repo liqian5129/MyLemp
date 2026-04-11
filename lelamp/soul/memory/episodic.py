@@ -99,9 +99,11 @@ class MemoryStream:
         self,
         active_file: Path = _ACTIVE_FILE,
         archive_file: Path = _ARCHIVE_FILE,
+        history_db=None,
     ):
         self._active_file  = active_file
         self._archive_file = archive_file
+        self._history_db   = history_db   # Optional[HistoryDB]，双写 SQLite
         self._entries: List[MemoryEntry] = []
         self._compacting   = asyncio.Lock()
         self._dirty        = False
@@ -125,11 +127,14 @@ class MemoryStream:
         type_: str,
         content: str,
         importance: Optional[float] = None,
+        timestamp: Optional[float] = None,
     ) -> MemoryEntry:
         """添加一条记忆，通知后台防抖写盘（不阻塞调用方）。
 
         Phase 3：只接受 heard/said/thought。其他类型（did/saw/felt）一律拒绝，
         从源头杜绝事件流被状态/控制信号污染。
+
+        timestamp: 可选，指定条目的时间戳（用于延迟写入时保留原始事件时间）。
         """
         if type_ not in ALLOWED_TYPES:
             raise ValueError(
@@ -137,7 +142,7 @@ class MemoryStream:
             )
         entry = MemoryEntry(
             id=str(uuid.uuid4())[:8],
-            timestamp=time.time(),
+            timestamp=timestamp or time.time(),
             type=type_,
             content=content[:500],
             importance=(
@@ -148,6 +153,14 @@ class MemoryStream:
         self._entries.append(entry)
         self._dirty = True
         self._flush_event.set()
+
+        # 双写 SQLite（best-effort，失败不影响主流程）
+        if self._history_db is not None:
+            try:
+                self._history_db.insert_one(entry)
+            except Exception as exc:
+                logger.debug("HistoryDB 实时写入失败: %s", exc)
+
         return entry
 
     def retrieve(self, n: int = RETRIEVE_TOP_N) -> List[MemoryEntry]:
@@ -235,8 +248,11 @@ class MemoryStream:
             and e.type in types
         ]
 
-    async def compact_if_needed(self, llm) -> None:
-        """压缩旧记忆为 reflection 条目。并发安全，重复调用无害。"""
+    async def compact_if_needed(self, llm, longterm=None) -> None:
+        """压缩旧记忆为 reflection 条目。并发安全，重复调用无害。
+
+        longterm: 可选的 LongTermMemory，压缩前提取长期记忆候选。
+        """
         if not self.should_compact():
             return
         async with self._compacting:
@@ -247,6 +263,24 @@ class MemoryStream:
 
             to_compact = sorted(active, key=lambda e: e.timestamp)[:COMPACT_COUNT]
             ids_to_compact = {e.id for e in to_compact}
+
+            # 压缩前提取长期记忆（best-effort，失败不影响压缩）
+            if longterm is not None:
+                try:
+                    from .consolidate import extract_longterm_memories
+                    ltm_candidates = await extract_longterm_memories(
+                        llm, to_compact, longterm,
+                    )
+                    for cand in ltm_candidates:
+                        await longterm.save(
+                            category=cand["category"],
+                            title=cand["title"],
+                            content=cand["content"],
+                            tags=cand.get("tags", []),
+                            source="compaction",
+                        )
+                except Exception as exc:
+                    logger.warning("长期记忆提取失败，不影响压缩: %s", exc)
 
             # 先总结，失败则保留原始条目（不归档）
             try:
@@ -303,6 +337,7 @@ class MemoryStream:
             logger.error("写盘失败（磁盘可能已满）: %s", exc)
 
     def _append_to_archive(self, entries: List[MemoryEntry]):
+        # JSON 备份（保留，向后兼容）
         try:
             existing: list = []
             if self._archive_file.exists():
@@ -316,6 +351,13 @@ class MemoryStream:
             )
         except OSError as exc:
             logger.warning("写 archive 失败: %s", exc)
+
+        # SQLite 双写（归档条目可能已在 add() 时写入，INSERT OR IGNORE 防重复）
+        if self._history_db is not None:
+            try:
+                self._history_db.insert(entries)
+            except Exception as exc:
+                logger.warning("HistoryDB 归档写入失败: %s", exc)
 
 
 _TYPE_LABEL_ZH = {

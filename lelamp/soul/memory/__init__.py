@@ -13,6 +13,8 @@ from .identity import IdentityMemory
 from .state import WorldState
 from .render import render_context_packet
 from .facts import FactStore, Fact
+from .longterm import LongTermMemory, LongTermEntry
+from .history_db import HistoryDB
 from .consolidate import (
     FactCandidate,
     PendingFactBuffer,
@@ -29,6 +31,9 @@ __all__ = [
     "render_context_packet",
     "FactStore",
     "Fact",
+    "LongTermMemory",
+    "LongTermEntry",
+    "HistoryDB",
     "FactCandidate",
     "PendingFactBuffer",
     "extract_facts",
