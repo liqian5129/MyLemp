@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional
 
+from lelamp.motion.compose_motion import MOTION_EXAMPLES
+from lelamp.service.motors.motion_scripts import MOTION_REGISTRY
 from lelamp.soul.audio_event import AudioEvent
 from lelamp.soul.memory import (
     FactStore,
@@ -94,10 +96,13 @@ PERSONALITY_PROMPT = """\
 你有一个灵活的身体，可以转头、抬头、低头、左右看。
 
 运动方式：
-  express_emotion — 预制情绪动作，表达情感时优先用这个，效果最好。
+  express_emotion — 预制情绪动作（10 类），适合简单情绪回应（点头、摇头、开心晃等）。
+                    可配 intensity 旋钮（0.3=克制，1.0=标准，1.5=夸张）。
+  compose_motion  — 自定义关键帧动作，适合**表演、模仿、创意动作**。
+                    当用户要求"表演XX""学XX""做个XX动作"时，compose 能做出更丰富生动的效果。
+                    先在 intent 写关节级分解（关节+模式+节奏），再据此出 segments，参考 <motion_examples>。
   body_move — 直接控制关节角度，当你想看某方向、追踪声源、探索环境，
               或做出情绪动作无法表达的姿态时使用。
-              返回值包含当前关节位置，可以记录到场景记忆中。
 
 方向参考：
   往左看：base_yaw=-40        往右看：base_yaw=40
@@ -142,7 +147,8 @@ look 返回值包含当前关节角度，可以把"这个角度看到了什么"�
 </identity_recognition>
 
 <tool_selection>
-  回应对话、表达情绪 → express_emotion
+  简单情绪回应（肯定、否定、开心、难过等） → express_emotion
+  表演、模仿、创意动作（"学XX""做个XX""表演XX"） → compose_motion（效果更丰富；compose 本身就是完整表演，结束后不要再追加 express_emotion）
   想看某个方向、追踪声源、探索 → body_move
   想看眼前有什么 → look
   记住某人的声音 → register_voice（需要刚听到语音）
@@ -308,17 +314,19 @@ SOUL_TOOLS = [
     {
         "name": "express_emotion",
         "description": (
-            "通过身体动作表达情绪。从以下动作中选择最合适的一个：\n"
+            "通过身体动作表达情绪。**优先使用此工具**，10 类标准动作覆盖大多数情绪场景。\n"
             "  nod          — 点头两次，表示肯定/打招呼\n"
             "  headshake    — 左右摇头两次，表示否定/困惑\n"
             "  curious      — 歪头转头打量，表示好奇/审视\n"
-            "  excited      — 整臂弹跳三次，表示兴奋/激动\n"
+            "  excited      — 整臂弹跳两次，表示兴奋/激动\n"
             "  happy_wiggle — 左右晃动四次，表示开心/雀跃\n"
             "  sad          — 灯头缓缓垂下再回来，表示难过/沮丧\n"
             "  scanning     — 大幅缓慢左右扫视，表示警惕/搜寻\n"
             "  shock        — 猛地后仰再慢回，表示震惊/吃惊\n"
             "  shy          — 偏头躲避再回正，表示害羞/不好意思\n"
-            "  wake_up      — 缓缓舒展昂起再环顾，表示精神振作"
+            "  wake_up      — 缓缓舒展昂起再环顾，表示精神振作\n"
+            "intensity 控制幅度和速度（0.3=克制，1.0=标准，1.5=夸张），默认 1.0。"
+            "例：好奇地瞥一眼 → curious intensity=0.5；强烈点头 → nod intensity=1.3"
         ),
         "input_schema": {
             "type": "object",
@@ -331,8 +339,65 @@ SOUL_TOOLS = [
                     ],
                     "description": "动作名称"
                 },
+                "intensity": {
+                    "type": "number",
+                    "minimum": 0.3,
+                    "maximum": 1.5,
+                    "description": "动作强度，影响幅度和速度，默认 1.0"
+                },
             },
             "required": ["name"]
+        }
+    },
+    {
+        "name": "compose_motion",
+        "description": (
+            "自定义关键帧动作，适合**表演、模仿、创意动作**。\n"
+            "当用户要求'表演XX''学XX''做个XX动作''假装XX'时，优先用此工具——"
+            "它比 express_emotion 能做出更丰富、更贴合语义的效果。\n"
+            "你必须先在 intent 字段写出关节级动作分解（哪些关节、什么模式、什么节奏），再据此写 segments。\n"
+            "查看系统 prompt 中的 <motion_examples> 段了解 6 个动作示例。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "description": "用一句中文写出动作的关节级分解：点名关节、运动模式、节奏。例：base_yaw 左右摆动 + wrist_roll 同向歪头，节奏均匀"
+                },
+                "segments": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 8,
+                    "description": "关键帧段列表，每段含 joints 和 duration",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "joints": {
+                                "type": "object",
+                                "description": (
+                                    "关节绝对角度。可选键：base_yaw, base_pitch, elbow_pitch, "
+                                    "wrist_roll, wrist_pitch。只填要动的关节，未填的自动维持上一段值。\n"
+                                    "范围参考（HOME 值）：\n"
+                                    "  base_yaw    -40=往左 0=正前 40=往右   HOME≈7\n"
+                                    "  base_pitch  -60=昂头 -38=HOME -15=前倾\n"
+                                    "  elbow_pitch 30=伸直 49=HOME 70=弯曲\n"
+                                    "  wrist_roll  -25=左歪 0=HOME 25=右歪\n"
+                                    "  wrist_pitch -75=低垂 -47=HOME 30=抬起"
+                                )
+                            },
+                            "duration": {
+                                "type": "number",
+                                "minimum": 0.15,
+                                "maximum": 2.0,
+                                "description": "本段时长（秒）。建议 ≥0.3s，低于 0.3s 会被速度安全网拉慢"
+                            }
+                        },
+                        "required": ["joints", "duration"]
+                    }
+                }
+            },
+            "required": ["intent", "segments"]
         }
     },
     {
@@ -1239,7 +1304,11 @@ class SoulAgent:
         )
 
         # 构建初始消息列表
-        messages: list[dict] = [{"role": "system", "content": PERSONALITY_PROMPT}]
+        # MOTION_EXAMPLES 拼在 PERSONALITY_PROMPT 之后，作为 compose_motion 的 few-shot
+        # 整段固定内容，会被 prompt cache 缓存
+        messages: list[dict] = [
+            {"role": "system", "content": PERSONALITY_PROMPT + "\n" + MOTION_EXAMPLES}
+        ]
         if image_path:
             img_data = self._llm._encode_image(image_path)
             if img_data:
@@ -1329,7 +1398,7 @@ class SoulAgent:
             # 按依赖关系排序：输出→动作→观察→依赖观察的工具
             _TOOL_EXEC_ORDER = {
                 "speak": 0,
-                "express_emotion": 1, "body_move": 1,
+                "express_emotion": 1, "compose_motion": 1, "body_move": 1,
                 "set_light_mood": 1, "set_rgb_solid": 1,
                 "look": 2, "recall_memory": 2, "session_search": 2,
                 "register_voice": 3, "update_scene_memory": 3,
@@ -1396,9 +1465,29 @@ class SoulAgent:
         logger.info("🔧 工具调用: %s  args=%s", name, args)
 
         if name == "express_emotion":
-            ename = (args.get("name") or "nod").strip()
-            self._motion_agent.play_emotion(ename)
-            return f"情绪动作：{ename}", None
+            ename     = (args.get("name") or "nod").strip()
+            intensity = float(args.get("intensity", 1.0))
+            if ename not in MOTION_REGISTRY:
+                return (
+                    f"express_emotion 失败：'{ename}' 不存在。"
+                    f"可用动作：{sorted(MOTION_REGISTRY.keys())}",
+                    None,
+                )
+            self._motion_agent.play_emotion(ename, intensity=intensity)
+            return f"情绪动作：{ename} (×{intensity:.1f})", None
+
+        elif name == "compose_motion":
+            intent   = (args.get("intent") or "").strip()
+            segments = args.get("segments") or []
+            if not intent:
+                return "compose_motion 失败：intent 不能为空（请用一句中文描述动作意图）", None
+            err = self._motion_agent.play_compose(intent, segments)
+            if err:
+                return (
+                    f"compose_motion 失败：{err}。请修正 segments 后重试。",
+                    None,
+                )
+            return f"自定义动作：{intent}（已是完整表演，无需追加动作）", None
 
         elif name == "speak":
             text = (args.get("text") or "").strip()

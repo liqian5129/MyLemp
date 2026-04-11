@@ -21,6 +21,9 @@ import threading
 import time
 from typing import Optional
 
+import numpy as np
+
+from lelamp.motion.motion_executor import JOINT_NAMES, velocity_safe_stretch
 from lelamp.service.motors.motion_scripts import MOTION_REGISTRY, _build_frames, HOME_POS
 
 logger = logging.getLogger(__name__)
@@ -72,6 +75,7 @@ class MotionAgent:
 
         # 线程
         self._lock    = threading.Lock()
+        self._io_lock = threading.Lock()  # 串口访问串行化（sync_read / sync_write）
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self.robot    = None
@@ -110,15 +114,52 @@ class MotionAgent:
 
     # ── 公共接口 ──────────────────────────────────────────────────────────────
 
-    def play_emotion(self, name: str):
-        """触发 MOTION_REGISTRY 动作（同步，立即返回）"""
+    def play_emotion(self, name: str, intensity: float = 1.0,
+                     jitter: float = 0.10, seed: Optional[int] = None):
+        """触发 MOTION_REGISTRY 动作（同步，立即返回）。
+        intensity: 0.3-1.5，控制幅度 + 速度（默认 1.0）
+        jitter:    0.0-0.3，每段随机抖动比例（默认 0.10）
+        seed:      可选，固定随机种子用于复现/测试
+        """
         if name not in MOTION_REGISTRY:
             logger.warning("未知情绪动作: %s，可用: %s", name, list(MOTION_REGISTRY))
             return
-        current = self._get_current_pos()
-        frames  = MOTION_REGISTRY[name](current)
+        intensity = max(0.3, min(1.5, float(intensity)))
+        jitter    = max(0.0, min(0.3, float(jitter)))
+        current   = self._predicted_start_pos()
+        frames    = MOTION_REGISTRY[name](current, intensity=intensity,
+                                          jitter=jitter, seed=seed)
+        frames    = self._velocity_audit(frames)
         self._enqueue_frames(frames)
-        logger.info("🎭 情绪动作: %s  %d frames", name, len(frames))
+        logger.info(
+            "🎭 %s  intensity=%.2f  %d frames",
+            name, intensity, len(frames),
+        )
+
+    def play_compose(self, intent: str, segments: list) -> Optional[str]:
+        """compose_motion 工具入口：LLM 直接给出 segments 列表。
+        返回错误字符串（用于回报 LLM）或 None（成功）。
+        """
+        from lelamp.motion.compose_motion import validate_segments
+
+        seg_list, err = validate_segments(segments)
+        if err:
+            logger.warning("compose_motion 校验失败: %s", err)
+            return f"segments 不合法：{err}"
+        if seg_list is None:
+            return "segments 校验返回空"
+
+        current = self._predicted_start_pos()
+        frames  = _build_frames(current, seg_list)
+        if not frames:
+            return "生成的帧序列为空"
+        frames  = self._velocity_audit(frames)
+        self._enqueue_frames(frames)
+        logger.info(
+            "🎨 compose_motion: %s  %d segs → %d frames",
+            (intent or "")[:30], len(seg_list), len(frames),
+        )
+        return None
 
     def is_playing(self) -> bool:
         """是否正在播放动作"""
@@ -140,7 +181,7 @@ class MotionAgent:
         if not clean:
             logger.warning("play_waypoint: 无有效关节")
             return
-        current  = self._get_current_pos()
+        current  = self._predicted_start_pos()
         duration = max(0.3, min(5.0, float(duration)))
         frames   = _build_frames(current, [(clean, duration)])
         if not frames:
@@ -229,22 +270,79 @@ class MotionAgent:
 
     # ── 工具方法 ──────────────────────────────────────────────────────────────
 
+    def _velocity_audit(self, frames: list[dict]) -> list[dict]:
+        """对 30fps 帧列表做速度安全检查。
+        超速时通过 velocity_safe_stretch 拉伸时间轴并按 fps 重采样回来；
+        正常情况直接返回原列表。
+        A 路径（play_emotion）和 C 路径（play_compose）共用此方法。
+        """
+        if len(frames) < 2:
+            return frames
+        n = len(frames)
+        t_arr = np.linspace(0.0, (n - 1) / self.fps, n, dtype=np.float32)
+        q_arr = np.array(
+            [[float(f.get(j, HOME_POS[j])) for j in JOINT_NAMES] for f in frames],
+            dtype=np.float32,
+        )
+        # 注意：不能用 motion_executor 的 Q_MIN/Q_MAX 二次 clip，那是另一套
+        # 废弃管道的坐标系（wrist_pitch 范围与本项目差 40°+）。
+        # _build_frames 内部已用 ±92° 限位，这里只做时间拉伸即可。
+        t_safe, q_safe = velocity_safe_stretch(t_arr, q_arr)
+
+        # 没触发拉伸 → 直通
+        if abs(float(t_safe[-1]) - float(t_arr[-1])) < 1e-3:
+            return frames
+
+        # 重采样回 fps
+        total = float(t_safe[-1])
+        n2 = max(2, int(total * self.fps))
+        t_uniform = np.linspace(0.0, total, n2)
+        out: list[dict] = []
+        for i in range(n2):
+            d = {}
+            for j_idx, j_name in enumerate(JOINT_NAMES):
+                d[j_name] = float(np.interp(t_uniform[i], t_safe, q_safe[:, j_idx]))
+            out.append(d)
+        logger.info("⚙️ velocity_audit  %d→%d frames  %.2fs→%.2fs",
+                    n, n2, float(t_arr[-1]), total)
+        return out
+
     def _get_current_pos(self) -> dict:
         """读取编码器当前位置；失败时返回 HOME_POS"""
         try:
             if self.robot is not None:
-                obs = self.robot.get_observation()
+                with self._io_lock:
+                    obs = self.robot.get_observation()
                 return {n: float(obs.get(f"{n}.pos", HOME_POS[n])) for n in HOME_POS}
         except Exception as e:
             logger.debug("读取关节位置失败（使用 HOME_POS）: %s", e)
         return dict(HOME_POS)
+
+    def _predicted_start_pos(self) -> dict:
+        """预测下一个新动作起播时的位置（供 play_emotion / play_compose / play_waypoint 用）。
+
+        - 若当前在 playing：返回当前 frames 的最后一帧
+          （新动作会替换 pending，最终接在当前 frames 之后；
+          以 frames 末尾为起点才能保证位置连续，避免动作衔接处跳变）
+        - 若 idle：读真实编码器（保留漂移恢复路径）
+
+        历史 bug：曾经直接用 _get_current_pos()，主线程读到的是入队"那一刻"的
+        编码器值，而下一动作真正播放时编码器已被前一动作改变，导致前一动作 →
+        新动作衔接处出现明显的位置跳变。
+        """
+        with self._lock:
+            if self._mode == "playing" and self._frames:
+                return dict(self._frames[-1])
+        # 锁外做 IO，避免和 _io_lock 嵌套且不阻塞控制循环
+        return self._get_current_pos()
 
     def _send_pos(self, pos: dict):
         """将 dict 格式位置发送给机器人"""
         action = {f"{name}.pos": pos[name] for name in HOME_POS}
         try:
             if self.robot is not None:
-                self.robot.send_action(action)
+                with self._io_lock:
+                    self.robot.send_action(action)
         except Exception as exc:
             logger.warning("send_action 失败: %s", exc)
 
