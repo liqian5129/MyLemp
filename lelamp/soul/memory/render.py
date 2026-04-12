@@ -20,6 +20,15 @@ if TYPE_CHECKING:
     from .state import WorldState
 
 
+def sanitize_names_in_text(content: str, names: set[str]) -> str:
+    """将已知人名替换为中性称呼，消除 few-shot 示范效应。"""
+    for name in sorted(names, key=len, reverse=True):
+        content = content.replace(f"{name}，", "")
+        content = content.replace(f"{name},", "")
+        content = content.replace(name, "用户")
+    return content.strip()
+
+
 def _fmt_relative(ts: Optional[float], now: float) -> Optional[str]:
     """把 unix timestamp 转换成 '12 秒前' / '3 分钟前' / '2 小时前' 的相对时间。"""
     if ts is None or ts <= 0:
@@ -106,12 +115,21 @@ def render_context_packet(
     today: Optional[str] = None,   # Phase 3 注入 today_narrative
     ltm_hint: Optional[str] = None,  # 长期记忆摘要提示
     trigger: str = "",
+    confirmed_speaker: Optional[str] = None,  # 当前声纹确认的身份
+    known_names: Optional[set[str]] = None,    # 所有已知人名（用于脱敏）
 ) -> str:
     """构造 ReAct initial user message 的正文。
 
     见模块 docstring 的段顺序。空段省略。
+
+    confirmed_speaker: 当前触发由声纹确认的说话人。为 None 时，
+                       [RECENT] 和 [FACTS] 中的人名会被脱敏，
+                       防止 LLM 在心跳/环境触发时凭记忆猜测身份。
     """
     sections: list[str] = []
+
+    # 脱敏策略：无确认身份时隐藏人名
+    sanitize = known_names if (confirmed_speaker is None and known_names) else None
 
     # [STATE]
     sections.append(_render_state(state.snapshot()))
@@ -119,8 +137,8 @@ def render_context_packet(
     # [FACTS]  — Phase 2 起
     if facts is not None:
         try:
-            facts_text = facts.format()  # type: ignore[attr-defined]
-        except AttributeError:
+            facts_text = facts.format(confirmed_speaker=confirmed_speaker)
+        except (AttributeError, TypeError):
             facts_text = None
         sec = _render_section("FACTS", facts_text)
         if sec:
@@ -136,7 +154,10 @@ def render_context_packet(
             sections.append(sec)
 
     # [TODAY]  — Phase 3 起
-    sec = _render_section("TODAY", today)
+    today_text = today
+    if today_text and sanitize:
+        today_text = sanitize_names_in_text(today_text, sanitize)
+    sec = _render_section("TODAY", today_text)
     if sec:
         sections.append(sec)
 
@@ -151,7 +172,7 @@ def render_context_packet(
 
     # [RECENT]
     try:
-        recent_text = episodic.format_for_prompt()
+        recent_text = episodic.format_for_prompt(sanitize_names=sanitize)
     except Exception:
         recent_text = None
     sec = _render_section("RECENT", recent_text)

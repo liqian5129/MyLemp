@@ -621,6 +621,7 @@ class DoubaoTTSPlayer:
                 except asyncio.TimeoutError:
                     continue
                 if self._interrupt_event.is_set():
+                    self._interrupt_event.clear()
                     continue
                 cur_frames_q: asyncio.Queue = asyncio.Queue()
                 cur_synth_task = asyncio.create_task(
@@ -707,11 +708,9 @@ class DoubaoTTSPlayer:
                     pass
 
             # ── 等 mpg123 播完 ────────────────────────────────────────────
+            # 注：proc.stdin 已在上方 close()，不再 abort transport，
+            #     否则异步回调会因内部状态已清理而抛 AttributeError。
             if self._interrupt_event.is_set():
-                try:
-                    proc.stdin.transport.abort()
-                except Exception:
-                    pass
                 proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=1.0)
@@ -724,10 +723,6 @@ class DoubaoTTSPlayer:
                 deadline = time.time() + 60.0
                 while proc.returncode is None:
                     if self._interrupt_event.is_set():
-                        try:
-                            proc.stdin.transport.abort()
-                        except Exception:
-                            pass
                         proc.terminate()
                         try:
                             await asyncio.wait_for(proc.wait(), timeout=1.0)
@@ -749,6 +744,7 @@ class DoubaoTTSPlayer:
             self._playing = False
             if self.on_play_end:
                 self.on_play_end()
+            self._interrupt_event.clear()
             elapsed = (time.time() - synth_start) * 1000
             logger.info(f"🔊 豆包 TTS 流式播完: {elapsed:.0f} ms, {total_bytes} bytes")
 
@@ -765,6 +761,7 @@ class DoubaoTTSPlayer:
                 continue
 
             if self._interrupt_event.is_set():
+                self._interrupt_event.clear()
                 continue
 
             is_first = (self.first_synth_start is None)
@@ -808,6 +805,7 @@ class DoubaoTTSPlayer:
                 continue
 
             if self._interrupt_event.is_set():
+                self._interrupt_event.clear()
                 while not self._audio_queue.empty():
                     try:
                         self._audio_queue.get_nowait()
@@ -853,6 +851,7 @@ class DoubaoTTSPlayer:
                 self._playing = False
                 if self.on_play_end:
                     self.on_play_end()
+                self._interrupt_event.clear()
 
     async def _play_via_mpg123(self, audio_data: bytes):
         """用 mpg123 stdin 播放：无临时文件，启动开销小"""

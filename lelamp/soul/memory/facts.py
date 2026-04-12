@@ -152,16 +152,14 @@ class FactStore:
         return None
 
     # ── 渲染 ──────────────────────────────────────────────────────────────
-    def format(self) -> str:
+    def format(self, confirmed_speaker: str | None = None) -> str:
         """渲染为 [FACTS] 段正文。
 
         分组顺序：identity → calling → preference → daily_reflection
         空分组省略。无任何条目时返回空串。
 
-        子分组用 "label:" 形式而非 "[label]"，避免和 render.py 的 [FACTS] 段头
-        形成二级方括号嵌套（LLM 会把内层 [身份] 误判为顶层段）。
-
-        daily_reflection 显示为 "历史日反思"，避免与 [TODAY] 段的"当天叙事"语义冲突。
+        confirmed_speaker: 当前声纹确认的说话人。为 None 时跳过
+        identity/calling 分组，防止 LLM 在心跳时凭身份信息猜名字。
         """
         sections: list[str] = []
         order = ["identity", "calling", "preference", "daily_reflection"]
@@ -172,6 +170,9 @@ class FactStore:
             "daily_reflection": "历史日反思",
         }
         for kind in order:
+            # 无确认身份时不暴露 identity/calling
+            if confirmed_speaker is None and kind in ("identity", "calling"):
+                continue
             items = self.list_by_kind(kind)
             if not items:
                 continue

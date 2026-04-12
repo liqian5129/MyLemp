@@ -187,9 +187,10 @@ async def main():
     )
     ear.on_event = agent.on_audio_event
 
-    # AEC：TTS 播放时 mute 耳朵，播放结束 unmute
+    # AEC：TTS 播放时进入 barge-in 模式，用户说话可打断
     tts.on_play_start = ear.mute
     tts.on_play_end = ear.unmute
+    ear.on_barge_in = tts.interrupt
 
     await ear.start()
     await tts.speak("呼——我醒来了。")

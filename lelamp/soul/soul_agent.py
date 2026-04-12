@@ -123,6 +123,14 @@ look 返回值包含当前关节角度，可以把"这个角度看到了什么"�
 但"找"的任务一定要包含 look，否则就是假装在找。
 </vision>
 
+<heartbeat_behavior>
+心跳触发时，你的重心是**人**，不是物品。
+1. 参考 [SCENE] 中用户通常出现的方位，用 body_move 转向那个方向，再 look 观察
+2. 如果画面中有人 → 观察他的表情、动作、姿态，据此决定互动方式
+3. 如果画面中没人 → 可以安静等待，偶尔环顾四周
+不要对着空桌子或物品自言自语。你关心的是人在做什么、状态怎样，而不是桌上摆了什么。
+</heartbeat_behavior>
+
 <identity_recognition>
 你能通过声纹识别认出熟悉的人。**当前对话对象的身份只能由当前触发消息中的 speaker 字段确认**，没有其他可靠的判断方式。
 
@@ -694,6 +702,7 @@ class SoulAgent:
         self._pending_heard: list[tuple[str, int]] = []  # 延迟写入：(text, importance)
         # _pending_audio_events 已移除：所有语音统一走 HeardSpeech 打断路径
         self._ticks_since_photo: int     = 0   # 连续未拍照的 TimerTick 次数
+        self._consecutive_empty_looks: int = 0  # 连续心跳看不到人的次数
 
         # Phase 1 新增
         self._scene_memory   = SceneMemory()
@@ -1159,10 +1168,24 @@ class SoulAgent:
             return False
         return True
 
+    def _heartbeat_interval(self) -> float:
+        """根据连续空看次数动态调整心跳间隔。
+
+        0-2 次没看到人 → 30s（正常频率）
+        3-5 次           → 60s
+        6+ 次            → 120s
+        """
+        n = self._consecutive_empty_looks
+        if n >= 6:
+            return 120.0
+        if n >= 3:
+            return 60.0
+        return TIMER_INTERVAL
+
     async def _timer_loop(self):
-        """固定间隔心跳：感知频率恒定，表达克制由 LLM 决策"""
+        """动态间隔心跳：连续看不到人时自动降频，有语音事件时恢复"""
         while True:
-            await asyncio.sleep(TIMER_INTERVAL)
+            await asyncio.sleep(self._heartbeat_interval())
             if self._is_idle():
                 try:
                     self._event_queue.put_nowait(TimerTick())
@@ -1181,6 +1204,7 @@ class SoulAgent:
                 self._event_queue.task_done()
 
     async def _process_event(self, event):
+        self._current_confirmed_speaker = None  # 默认无确认身份
         if isinstance(event, TimerTick):
             self._ticks_since_photo += 1
             self._event_source = "heartbeat"
@@ -1195,7 +1219,7 @@ class SoulAgent:
                 name="soul-narrative",
             )
 
-            trigger = "心跳触发。"
+            trigger = "心跳触发。参考 [SCENE] 找到用户通常的方位，转向那里观察用户状态再决定行动。"
 
         elif isinstance(event, ReminderFired):
             self._event_source = "reminder"
@@ -1212,8 +1236,14 @@ class SoulAgent:
                 trigger_parts.append(f"用户行为：{event.user_activity}")
             trigger = "\n".join(trigger_parts)
         else:  # HeardSpeech
-            self._speech_pending.clear()   # 清除标志，本轮 _think 可以完整运行
+            self._speech_pending.clear()
             self._event_source = "user"
+            self._current_confirmed_speaker = event.speaker  # 声纹确认的身份（或 None）
+            # 用户说话 → 重置心跳降频计数，恢复正常感知频率
+            if self._consecutive_empty_looks > 0:
+                logger.info("💤→🔔 用户说话，心跳恢复正常频率（之前连续 %d 次空看）",
+                            self._consecutive_empty_looks)
+                self._consecutive_empty_looks = 0
             # 延迟写入：记录待写的 heard，_think 后根据是否 spoke 决定
             self._spoke_this_think = False
             self._pending_heard = [(event.text, event.importance, time.time())]
@@ -1232,7 +1262,9 @@ class SoulAgent:
             if event.name_mentioned:
                 trigger_parts.append(
                     "对方叫了你的名字。请先用 speak 回应。"
-                    "说话时应该面向用户，用 body_move 转向他所在的方向（参考场景记忆中的位置）。"
+                    "然后用 body_move 转向用户方向（参考场景记忆）+ look。"
+                    "如果画面里没看到人，换其他方向继续找（左、正前、右都试试）。"
+                    "找到了就 update_scene_memory 更新位置；找不到也没关系。"
                 )
             elif event.speaker is not None:
                 # 已注册说话人，主 LLM 基于上下文判断
@@ -1241,6 +1273,7 @@ class SoulAgent:
                     "参考 [RECENT] 里你最近说了什么、问了什么——"
                     "如果是在回答你的问题或对你说话，用 speak 回应；"
                     "如果像是自言自语、与他人交谈、或视频内容，用 wait 安静观察。"
+                    "回应后如果 look 没看到人，换其他方向找找；找不到也没关系。"
                 )
             else:
                 # 未注册但叫了名字（通过门控的唯一可能）
@@ -1293,14 +1326,27 @@ class SoulAgent:
             ltm_hint = summary if summary else "（暂无长期记忆）"
         else:
             ltm_hint = None
+
+        # 收集已知人名：无确认身份时用于脱敏 [RECENT] 和 [FACTS]
+        confirmed = getattr(self, "_current_confirmed_speaker", None)
+        known_names: set[str] = set()
+        for ident in self._identity_memory.list_identities():
+            known_names.add(ident["name"])
+        facts_store = getattr(self, "_facts", None)
+        if facts_store:
+            for fact in facts_store.list_by_kind("calling"):
+                known_names.add(fact.value)
+
         initial_text = render_context_packet(
             state=self._state,
             episodic=self._mem,
             scene=self._scene_memory,
-            facts=getattr(self, "_facts", None),            # Phase 2 起非空
+            facts=facts_store,
             today=getattr(self, "_today_narrative", None),  # Phase 3 起非空
             ltm_hint=ltm_hint,
             trigger=trigger,
+            confirmed_speaker=confirmed,
+            known_names=known_names or None,
         )
 
         # 构建初始消息列表
@@ -1508,6 +1554,9 @@ class SoulAgent:
                 self._spoke_this_think = True
                 if self._event_source in ("heartbeat", "environment"):
                     self._record_proactive_speech()
+                # 心跳时主动说话 → 说明看到了人，重置空看计数
+                if self._event_source == "heartbeat" and self._consecutive_empty_looks > 0:
+                    self._consecutive_empty_looks = 0
                 return f"已说：{text}", None
             return "speak: 文本为空", None
 
@@ -1600,6 +1649,15 @@ class SoulAgent:
         elif name == "wait":
             reason = (args.get("reason") or "").strip()
             logger.info("⏸️  wait: %s", reason or "（无原因）")
+            # 心跳触发 wait → 视为"没找到人"，累加空看计数
+            if self._event_source == "heartbeat":
+                self._consecutive_empty_looks += 1
+                if self._consecutive_empty_looks == 3:
+                    logger.info("💤 连续 %d 次心跳没看到人，降频到 60s",
+                                self._consecutive_empty_looks)
+                elif self._consecutive_empty_looks == 6:
+                    logger.info("💤 连续 %d 次心跳没看到人，降频到 120s",
+                                self._consecutive_empty_looks)
             return f"保持观察：{reason}", None
 
         elif name == "forget_fact":

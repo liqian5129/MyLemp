@@ -189,14 +189,13 @@ class MemoryStream:
 
         return recent + rest_sorted
 
-    def format_for_prompt(self) -> str:
+    def format_for_prompt(self, sanitize_names: Optional[set[str]] = None) -> str:
         """
         紧凑格式，带日期、会话间隔分隔和"距今 X 分钟前"相对时间。
-        示例：
-          [03-30 21:15 HEA · 18 小时前] 有人说：小Q 你好
-          --- (间隔 12 小时) ---
-          [09:15 HEA · 5 分钟前] 早上好
-          [09:15 SAI · 5 分钟前] 哒！早上好！
+
+        sanitize_names: 当前无确认身份时，传入已知人名集合，
+                        历史条目中的名字会被替换为中性称呼，
+                        防止 LLM 在心跳时凭记忆猜测身份。
         """
         entries = self.retrieve()
         if not entries:
@@ -226,7 +225,11 @@ class MemoryStream:
 
             tag = e.type[:3].upper()
             rel = _format_relative(now - e.timestamp)
-            lines.append(f"[{t} {tag} · {rel}] {e.content}")
+            content = e.content
+            if sanitize_names:
+                from .render import sanitize_names_in_text
+                content = sanitize_names_in_text(content, sanitize_names)
+            lines.append(f"[{t} {tag} · {rel}] {content}")
             prev_ts = e.timestamp
 
         return "\n".join(lines)
