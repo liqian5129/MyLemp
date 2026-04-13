@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from lelamp.service.motors.motion_scripts import JOINT_LIMITS
+
 # ── 校验常量 ─────────────────────────────────────────────────────────────────
 
 VALID_JOINTS = {"base_yaw", "base_pitch", "elbow_pitch", "wrist_roll", "wrist_pitch"}
@@ -17,7 +19,7 @@ MAX_SEG_COUNT = 12
 MIN_DUR       = 0.15
 MAX_DUR       = 2.0
 MAX_TOTAL_DUR = 8.0
-JOINT_RANGE   = (-92.0, 92.0)
+_DEFAULT_RANGE = (-92.0, 92.0)
 
 
 # ── 校验器 ───────────────────────────────────────────────────────────────────
@@ -65,8 +67,9 @@ def validate_segments(segments) -> tuple[Optional[list], Optional[str]]:
                 vf = float(v)
             except (TypeError, ValueError):
                 return None, f"段 {idx} 关节 {k} 值不是数字"
-            if not (JOINT_RANGE[0] <= vf <= JOINT_RANGE[1]):
-                return None, f"段 {idx} 关节 {k}={vf} 超出 {JOINT_RANGE}"
+            lo, hi = JOINT_LIMITS.get(k, _DEFAULT_RANGE)
+            if not (lo <= vf <= hi):
+                return None, f"段 {idx} 关节 {k}={vf} 超出 [{lo}, {hi}]"
             clean_joints[k] = vf
 
         total += dur
@@ -80,62 +83,64 @@ def validate_segments(segments) -> tuple[Optional[list], Optional[str]]:
 # ── Few-shot 示例库 ──────────────────────────────────────────────────────────
 # 写法故意贴近 _build_frames 的输入格式（绝对角度，非 delta），
 # 让 LLM 看到：关节值是绝对的，起点是当前姿态。
-# HOME 值参考：base_yaw=7  base_pitch=-38  elbow_pitch=49  wrist_roll=0  wrist_pitch=-47
+# HOME 值参考：base_yaw=18  base_pitch=-12  elbow_pitch=53  wrist_roll=-6  wrist_pitch=55
+# ⚠️ wrist_pitch 方向：正值=低垂，负值=抬起（与直觉相反）
 
 MOTION_EXAMPLES = """
 <motion_examples>
 以下是 6 个标准动作的关键帧定义，供你 compose_motion 时参考。
 所有数值是绝对关节角度（不是相对当前位置），最后一段都回到 HOME 附近。
+⚠️ wrist_pitch 方向注意：正值=低垂，负值=抬起
 
 示例 1 — nod 点头两次
 intent: wrist_pitch 两次快速下探回弹，节奏均匀
 segments:
-  [{"joints": {"wrist_pitch": -69}, "duration": 0.35},
-   {"joints": {"wrist_pitch": -39}, "duration": 0.35},
-   {"joints": {"wrist_pitch": -69}, "duration": 0.35},
-   {"joints": {"wrist_pitch": -47}, "duration": 0.45}]
+  [{"joints": {"wrist_pitch": 70}, "duration": 0.35},
+   {"joints": {"wrist_pitch": 47}, "duration": 0.35},
+   {"joints": {"wrist_pitch": 70}, "duration": 0.35},
+   {"joints": {"wrist_pitch": 55}, "duration": 0.45}]
 
 示例 2 — headshake 摇头
 intent: base_yaw 左右摆动一个来回，幅度对称
 segments:
-  [{"joints": {"base_yaw": -15}, "duration": 0.35},
-   {"joints": {"base_yaw":  29}, "duration": 0.40},
-   {"joints": {"base_yaw": -15}, "duration": 0.35},
-   {"joints": {"base_yaw":   7}, "duration": 0.40}]
+  [{"joints": {"base_yaw": -5}, "duration": 0.35},
+   {"joints": {"base_yaw": 39}, "duration": 0.40},
+   {"joints": {"base_yaw": -5}, "duration": 0.35},
+   {"joints": {"base_yaw": 18}, "duration": 0.40}]
 
 示例 3 — curious 歪头打量
 intent: base_yaw 转右 + wrist_roll 同向歪头，停顿一拍后回正
 segments:
-  [{"joints": {"base_yaw": 25, "wrist_roll":  22}, "duration": 0.80},
-   {"joints": {"base_yaw": 25, "wrist_roll":  22}, "duration": 0.40},
-   {"joints": {"base_yaw": -5, "wrist_roll": -10}, "duration": 0.70},
-   {"joints": {"base_yaw":  7, "wrist_roll":   0}, "duration": 0.80}]
+  [{"joints": {"base_yaw": 35, "wrist_roll":  17}, "duration": 0.80},
+   {"joints": {"base_yaw": 35, "wrist_roll":  17}, "duration": 0.40},
+   {"joints": {"base_yaw":  5, "wrist_roll": -15}, "duration": 0.70},
+   {"joints": {"base_yaw": 18, "wrist_roll":  -6}, "duration": 0.80}]
 
 示例 4 — sad 沮丧低头
-intent: wrist_pitch 缓慢降到最低，长停顿，再慢速回正
+intent: wrist_pitch 缓慢升到最高（低垂），长停顿，再慢速回正
 segments:
-  [{"joints": {"wrist_pitch": -75}, "duration": 1.50},
-   {"joints": {"wrist_pitch": -75}, "duration": 1.00},
-   {"joints": {"wrist_pitch": -47}, "duration": 1.80}]
+  [{"joints": {"wrist_pitch": 70}, "duration": 1.50},
+   {"joints": {"wrist_pitch": 70}, "duration": 1.00},
+   {"joints": {"wrist_pitch": 55}, "duration": 1.80}]
 
 示例 5 — shock 震惊后仰
-intent: wrist_pitch 上扬 + base_pitch 后仰同时快弹，短停顿后回正
+intent: wrist_pitch 下降（抬头）+ base_pitch 后仰同时快弹，短停顿后回正
 segments:
-  [{"joints": {"wrist_pitch": -33, "base_pitch": -46}, "duration": 0.30},
-   {"joints": {"wrist_pitch": -33, "base_pitch": -46}, "duration": 0.35},
-   {"joints": {"wrist_pitch": -47, "base_pitch": -38}, "duration": 0.50}]
+  [{"joints": {"wrist_pitch": 41, "base_pitch": -20}, "duration": 0.30},
+   {"joints": {"wrist_pitch": 41, "base_pitch": -20}, "duration": 0.35},
+   {"joints": {"wrist_pitch": 55, "base_pitch": -12}, "duration": 0.50}]
 
 示例 6 — excited 兴奋弹跳两次
 intent: base_pitch + elbow_pitch + wrist_pitch 三关节联动，上下弹跳两次
 segments:
-  [{"joints": {"base_pitch": -30, "elbow_pitch": 42, "wrist_pitch": -40}, "duration": 0.45},
-   {"joints": {"base_pitch": -38, "elbow_pitch": 49, "wrist_pitch": -47}, "duration": 0.40},
-   {"joints": {"base_pitch": -30, "elbow_pitch": 42, "wrist_pitch": -40}, "duration": 0.40},
-   {"joints": {"base_pitch": -38, "elbow_pitch": 49, "wrist_pitch": -47}, "duration": 0.50}]
+  [{"joints": {"base_pitch": -4, "elbow_pitch": 46, "wrist_pitch": 48}, "duration": 0.45},
+   {"joints": {"base_pitch": -12, "elbow_pitch": 53, "wrist_pitch": 55}, "duration": 0.40},
+   {"joints": {"base_pitch": -4, "elbow_pitch": 46, "wrist_pitch": 48}, "duration": 0.40},
+   {"joints": {"base_pitch": -12, "elbow_pitch": 53, "wrist_pitch": 55}, "duration": 0.50}]
 
 构造原则：
 1. 起点是当前姿态（不需要写），最后一段建议回到 HOME 附近：
-   base_yaw≈7  base_pitch≈-38  elbow_pitch≈49  wrist_roll≈0  wrist_pitch≈-47
+   base_yaw≈18  base_pitch≈-12  elbow_pitch≈53  wrist_roll≈-6  wrist_pitch≈55
 2. 想表达"两次/三次"循环时，4-5 段比 2 段更生动（有回弹感）
 3. 想表达"停顿/凝视"时，重复一段同样的 joints 即可
 4. duration 要和角度变化幅度匹配：

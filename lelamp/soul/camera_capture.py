@@ -100,6 +100,11 @@ class CameraCapture:
 
     # ── 主动抓帧 ──────────────────────────────────────────────────────────────
 
+    def get_latest_frame(self) -> np.ndarray | None:
+        """返回最新帧的副本（线程安全）。未采集过帧时返回 None。"""
+        with self._frame_lock:
+            return self._latest_frame.copy() if self._latest_frame is not None else None
+
     def take_snapshot(self) -> str | None:
         """主动抓取当前最新帧，保存为临时 jpg，返回路径（调用方负责删除）。
         需等摄像头线程已启动且至少采集过一帧，否则返回 None。

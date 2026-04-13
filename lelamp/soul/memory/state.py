@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 # ── 字段硬长度上限 ────────────────────────────────────────────────────────
 _FIELD_MAX_LEN = {
-    "body_status": 80,
+    "body_status": 100,
     "last_audio_env": 40,
     "last_user_activity": 40,
     "last_user_speaker": 20,

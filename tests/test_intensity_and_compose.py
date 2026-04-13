@@ -15,7 +15,6 @@ import sys
 import traceback
 
 from lelamp.motion.compose_motion import (
-    JOINT_RANGE,
     MAX_SEG_COUNT,
     MAX_TOTAL_DUR,
     MIN_SEG_COUNT,

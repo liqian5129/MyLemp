@@ -3,27 +3,40 @@
 每个动作函数接收当前关节位置，返回帧序列（list of dict），在当前姿态基础上执行动作。
 
 安全约束：
-- 所有目标角度 clamp 到 [-92, 92]，留 8 单位安全余量
+- 所有目标角度按关节物理极限 clamp（含 5° 安全余量）
 - 每段过渡时长控制在速度 ≤ 60°/s（≈ 2 单位/帧 @30fps）
 - 不操作的关节保持当前位置不动
 """
+import logging
 import random
 
-CLAMP_MIN = -92.0
-CLAMP_MAX = 92.0
+logger = logging.getLogger(__name__)
+
 FPS = 30
 
 HOME_POS = {
-    "base_yaw":    7.4,
-    "base_pitch":  -38.4,
-    "elbow_pitch": 48.5,
-    "wrist_roll":  -0.2,
-    "wrist_pitch": -46.9,
+    "base_yaw":    17.8,
+    "base_pitch":  -12.2,
+    "elbow_pitch": 52.9,
+    "wrist_roll":  -5.5,
+    "wrist_pitch": 54.6,
 }
 
+# 实测物理极限 + 5° 安全余量
+JOINT_LIMITS = {
+    "base_yaw":    (-91.0, 95.0),
+    "base_pitch":  (-95.0, 95.0),
+    "elbow_pitch": (30.0, 95.0),
+    "wrist_roll":  (-95.0, 76.0),
+    "wrist_pitch": (-92.0, 72.0),
+}
 
-def _clamp(v: float) -> float:
-    return max(CLAMP_MIN, min(CLAMP_MAX, v))
+_DEFAULT_LIMIT = (-92.0, 92.0)
+
+
+def _clamp(v: float, joint: str = "") -> float:
+    lo, hi = JOINT_LIMITS.get(joint, _DEFAULT_LIMIT)
+    return max(lo, min(hi, v))
 
 
 def _smoothstep(t: float) -> float:
@@ -84,7 +97,7 @@ def _build_frames(current: dict, segments: list) -> list:
         target_full = dict(prev)
         for k, v in target_partial.items():
             if k in target_full:
-                target_full[k] = _clamp(v)
+                target_full[k] = _clamp(v, k)
         t_acc += max(1e-3, float(duration))
         waypoints.append(target_full)
         timestamps.append(t_acc)
@@ -140,8 +153,8 @@ def nod(pos: dict, intensity: float = 1.0, jitter: float = 0.10, seed=None) -> l
     """
     rng = random.Random(seed)
     p = pos["wrist_pitch"]
-    down = _clamp(p - _scaled(rng, 22, intensity, jitter))
-    up   = _clamp(p + _scaled(rng,  8, intensity, jitter))
+    down = _clamp(p + _scaled(rng, 22, intensity, jitter))
+    up   = _clamp(p - _scaled(rng,  8, intensity, jitter))
     return _build_frames(pos, [
         ({"wrist_pitch": down}, _scaled_dur(rng, 0.30, intensity, jitter)),
         ({},                    _scaled_dur(rng, 0.18, intensity, jitter)),  # hold@底
@@ -199,7 +212,7 @@ def excited(pos: dict, intensity: float = 1.0, jitter: float = 0.10, seed=None) 
     wp = pos["wrist_pitch"]
     up_bp = _clamp(bp + _scaled(rng, 8, intensity, jitter))
     up_ep = _clamp(ep - _scaled(rng, 7, intensity, jitter))
-    up_wp = _clamp(wp + _scaled(rng, 7, intensity, jitter))
+    up_wp = _clamp(wp - _scaled(rng, 7, intensity, jitter))
     return _build_frames(pos, [
         ({"base_pitch": up_bp, "elbow_pitch": up_ep, "wrist_pitch": up_wp},
          _scaled_dur(rng, 0.45, intensity, jitter)),
@@ -237,7 +250,7 @@ def sad(pos: dict, intensity: float = 1.0, jitter: float = 0.10, seed=None) -> l
     """伤心：灯头缓缓垂下，停留，慢慢回来"""
     rng = random.Random(seed)
     wp = pos["wrist_pitch"]
-    down = _clamp(wp - _scaled(rng, 28, intensity, jitter))
+    down = _clamp(wp + _scaled(rng, 28, intensity, jitter))
     return _build_frames(pos, [
         ({"wrist_pitch": down}, _scaled_dur(rng, 1.5, intensity, jitter)),
         ({},                    _scaled_dur(rng, 1.0, intensity, jitter)),  # 停留
@@ -263,7 +276,7 @@ def shock(pos: dict, intensity: float = 1.0, jitter: float = 0.10, seed=None) ->
     rng = random.Random(seed)
     wp = pos["wrist_pitch"]
     bp = pos["base_pitch"]
-    back_wp = _clamp(wp + _scaled(rng, 14, intensity, jitter))
+    back_wp = _clamp(wp - _scaled(rng, 14, intensity, jitter))
     back_bp = _clamp(bp - _scaled(rng,  8, intensity, jitter))
     return _build_frames(pos, [
         ({"wrist_pitch": back_wp, "base_pitch": back_bp},
@@ -283,7 +296,7 @@ def shy(pos: dict, intensity: float = 1.0, jitter: float = 0.10, seed=None) -> l
     return _build_frames(pos, [
         ({"base_yaw":   _clamp(y - _scaled(rng, 25, intensity, jitter)),
           "wrist_roll": _clamp(r + _scaled(rng, 28, intensity, jitter)),
-          "wrist_pitch": _clamp(wp - _scaled(rng, 10, intensity, jitter))},
+          "wrist_pitch": _clamp(wp + _scaled(rng, 10, intensity, jitter))},
          _scaled_dur(rng, 1.0, intensity, jitter)),
         ({}, _scaled_dur(rng, 1.2, intensity, jitter)),
         ({"base_yaw": y, "wrist_roll": r, "wrist_pitch": wp},
@@ -310,10 +323,10 @@ def breath_cycle(pos: dict) -> list:
     return _build_frames(pos, [
         # 右漂·抬头：吸气感
         ({"base_yaw": _clamp(y + 20), "wrist_roll": _clamp(r + 15),
-          "wrist_pitch": _clamp(wp + 8)},  3.5),
+          "wrist_pitch": _clamp(wp - 8)},  3.5),
         # 转向左·低头：呼气感
         ({"base_yaw": _clamp(y - 17), "wrist_roll": _clamp(r - 13),
-          "wrist_pitch": _clamp(wp - 7)},  4.0),
+          "wrist_pitch": _clamp(wp + 7)},  4.0),
         # 缓缓回正
         ({"base_yaw": y, "wrist_roll": r, "wrist_pitch": wp}, 2.5),
     ])
@@ -334,6 +347,79 @@ def idle_glance(pos: dict) -> list:
     ])
 
 
+def idle_breath(pos: dict, intensity: float = 1.0, jitter: float = 0.30, seed=None) -> list:
+    """呆萌呼吸：极微幅的头部晃动，随机选一种变体，让每次心跳看起来不一样。
+
+    变体池（随机选 1）：
+      - 轻叹气：微微低头再回来
+      - 左歪头：小幅歪向一侧
+      - 右歪头：小幅歪向另一侧
+      - 伸懒腰：微微抬头展开
+      - 小晃神：先向一侧偏，再向另一侧偏，回正
+
+    幅度极小（3-8°），时长缓慢（1.5-3s），营造安静但有生命感的呼吸节奏。
+    """
+    rng = random.Random(seed)
+    y  = pos["base_yaw"]
+    bp = pos["base_pitch"]
+    ep = pos["elbow_pitch"]
+    r  = pos["wrist_roll"]
+    wp = pos["wrist_pitch"]
+
+    # 幅度缩放
+    def _s(base):
+        return base * intensity * rng.uniform(1.0 - jitter, 1.0 + jitter)
+
+    variant = rng.choice(["sigh", "tilt_l", "tilt_r", "stretch", "drift"])
+    logger.info("idle_breath 变体: %s", variant)
+
+    if variant == "sigh":
+        # 轻叹气：低头 + 收肘
+        dip = _s(12.0)
+        return _build_frames(pos, [
+            ({"wrist_pitch": _clamp(wp + dip), "elbow_pitch": _clamp(ep - _s(7.0))}, _s(1.2)),
+            ({},                                                                      _s(0.6)),
+            ({"wrist_pitch": wp, "elbow_pitch": ep},                                  _s(1.0)),
+        ])
+
+    elif variant == "tilt_l":
+        # 左歪头
+        roll_d = _s(16.0)
+        return _build_frames(pos, [
+            ({"wrist_roll": _clamp(r - roll_d), "base_yaw": _clamp(y - _s(6.0))}, _s(1.0)),
+            ({},                                                                    _s(0.8)),
+            ({"wrist_roll": r, "base_yaw": y},                                     _s(0.8)),
+        ])
+
+    elif variant == "tilt_r":
+        # 右歪头
+        roll_d = _s(16.0)
+        return _build_frames(pos, [
+            ({"wrist_roll": _clamp(r + roll_d), "base_yaw": _clamp(y + _s(6.0))}, _s(1.0)),
+            ({},                                                                    _s(0.8)),
+            ({"wrist_roll": r, "base_yaw": y},                                     _s(0.8)),
+        ])
+
+    elif variant == "stretch":
+        # 伸懒腰：抬头 + 展肘
+        lift = _s(12.0)
+        return _build_frames(pos, [
+            ({"wrist_pitch": _clamp(wp - lift), "elbow_pitch": _clamp(ep + _s(8.0))}, _s(1.5)),
+            ({},                                                                       _s(0.5)),
+            ({"wrist_pitch": wp, "elbow_pitch": ep},                                   _s(1.2)),
+        ])
+
+    else:  # drift
+        # 小晃神：左偏→右偏→回正
+        d1 = _s(8.0) * rng.choice([-1, 1])
+        d2 = -d1 * rng.uniform(0.6, 1.0)
+        return _build_frames(pos, [
+            ({"base_yaw": _clamp(y + d1), "wrist_roll": _clamp(r + d1 * 0.5)}, _s(1.0)),
+            ({"base_yaw": _clamp(y + d2), "wrist_roll": _clamp(r + d2 * 0.5)}, _s(1.0)),
+            ({"base_yaw": y, "wrist_roll": r},                                  _s(0.8)),
+        ])
+
+
 # ─────────────────────────────────────────────
 # 动作注册表
 # ─────────────────────────────────────────────
@@ -349,4 +435,5 @@ MOTION_REGISTRY = {
     "shock":       shock,
     "shy":         shy,
     "wake_up":     wake_up,
+    "idle_breath": idle_breath,
 }

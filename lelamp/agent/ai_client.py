@@ -68,11 +68,17 @@ class AIClient:
         self.reasoning_effort = reasoning_effort
 
         # 创建 OpenAI 客户端
+        default_headers = {}
+        if self.provider == "openrouter":
+            default_headers["HTTP-Referer"] = "https://github.com/lelamp"
+            default_headers["X-Title"] = "LeLamp"
+
         self.client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
+            default_headers=default_headers or None,
         )
 
         logger.info(f"🤖 AI 客户端初始化: {provider} / {model}")
@@ -87,6 +93,8 @@ class AIClient:
             if "k2" in self.model and not self.enable_thinking:
                 return 0.6
             return 1.0
+        elif self.provider == "openrouter":
+            return 0.7
         elif self.provider == "qwen":
             return 0.7
         else:  # doubao
@@ -100,6 +108,7 @@ class AIClient:
         # Qwen3 关闭 thinking，避免思考链死循环
         if self.provider == "qwen":
             return {"enable_thinking": False}
+        # OpenRouter / Claude 无需额外参数
         return None
 
     def _encode_image(self, image_path: str) -> Optional[str]:

@@ -56,6 +56,7 @@ class HeardSpeech:
     voice_embedding: object = None  # np.ndarray, 供 register_voice 使用
     name_mentioned: bool = False    # 文本中是否包含"小Q"
     importance: int = 7              # 记忆写入优先级（awaiting_reply 时为 9）
+    is_activity_only: bool = False   # 非语言活动（咳嗽、唱歌等），无实际语音文本
 
 @dataclass
 class TimerTick:
@@ -65,6 +66,8 @@ class TimerTick:
 class EnvironmentChange:
     audio_env: str = ""
     user_activity: str = "未知"
+    image_path: str | None = None  # 视觉触发的快照路径
+    source: str = "audio"          # "audio" | "visual"
 
 @dataclass
 class ReminderFired:
@@ -93,7 +96,29 @@ PERSONALITY_PROMPT = """\
 说话简短有趣，偶尔用拟声词，只说中文。不要重复刚刚说过的话。
 
 <body>
-你有一个灵活的身体，可以转头、抬头、低头、左右看。
+你是一盏台灯机器人，身体是一条从底座到头部的串联臂：
+
+  底座（固定在桌面）
+    → base_yaw      水平旋转：小=左，大=右
+    → base_pitch    底座前后倾斜：小=后仰，大=前倾
+      → elbow_pitch   肘部弯折：小=上臂竖直，大=上臂向前折叠
+        → wrist_roll     头部左右歪：小=左歪，大=右歪
+          → wrist_pitch    头部俯仰：小=抬头，大=低头（⚠️方向反直觉）
+
+关键物理规则：
+- 每个关节转动时，它上方的所有部件都跟着动
+- base_pitch 前倾 → 肘、头都往前移（这是"往前"的主要关节）
+- elbow_pitch 只改变上臂与下臂的折角，不直接控制前后
+  - 值变小 → 上臂竖起来，头往上抬
+  - 值变大 → 上臂折叠，头往下压
+- wrist_pitch/wrist_roll 只影响头部朝向，不改变头的位置
+
+关节范围：
+  base_yaw:    [-91, 95]  HOME≈18
+  base_pitch:  [-95, 95]  HOME≈-12
+  elbow_pitch: [30, 95]   HOME≈53
+  wrist_pitch: [-92, 72]  HOME≈55
+  wrist_roll:  [-95, 76]  HOME≈-6
 
 运动方式：
   express_emotion — 预制情绪动作（10 类），适合简单情绪回应（点头、摇头、开心晃等）。
@@ -104,28 +129,55 @@ PERSONALITY_PROMPT = """\
   body_move — 直接控制关节角度，当你想看某方向、追踪声源、探索环境，
               或做出情绪动作无法表达的姿态时使用。
 
-方向参考：
-  往左看：base_yaw=-40        往右看：base_yaw=40
-  往上看：wrist_pitch=30      往下看：wrist_pitch=-75
-  挺直昂起：base_pitch=-60    前倾：base_pitch=-15
-  组合示例——往右上方看：base_yaw=35, wrist_pitch=25
-  注意：wrist_pitch 正数=抬头，负数=低垂；base_pitch 负数=直立，正数=前倾
+⚠️ 严禁输出超出关节范围的角度值！超出范围的指令会被系统拒绝，浪费一轮交互。
+调整角度时，先小幅调整（10-20°）+ look 确认效果，不够再加。
+不要一步到极限——看旁边的人只需微微抬头，不是仰望天花板。
 
-休息姿态：用户说"自己玩""别看了""去休息""不用管我"等类似意思时，你必须立即用 body_move 回到正前方放松姿态（base_yaw=0, base_pitch=-38, wrist_pitch=-47）。不回正就是一直盯着人看，会让用户不舒服。
+空间动作参考（body_move 多关节组合）：
+  往前伸：base_pitch 增大（前倾），elbow_pitch 基本不变 → 整体前推
+  往后缩：base_pitch 减小（后仰），elbow_pitch 基本不变 → 整体后缩
+  低头看近处：base_pitch 增大 + wrist_pitch 增大（低头）→ 头凑近桌面
+  抬头看远处：base_pitch 减小 + wrist_pitch 减小（抬头）→ 仰望远方
+  探头看右边：base_yaw 增大 + base_pitch 略增 → 往右前方探出去
+  ⚠️ 这些动作是相对 HOME 的方向指引，具体幅度按需调整（10-20°起步）
+
+休息姿态：用户说"自己玩""别看了""去休息""不用管我"等类似意思时，你必须立即用 body_move 回到正前方放松姿态（base_yaw=0, base_pitch=-12, wrist_pitch=55）。不回正就是一直盯着人看，会让用户不舒服。
 </body>
 
 <vision>
-你的视觉来源只有 look 工具的返回值。body_move 只控制身体运动，不返回任何画面。
+你的视觉来源**只有** look 工具的返回值。没有调 look 就等于闭着眼睛。
+body_move 只控制身体运动，不返回任何画面。
 随时可以调用 look 看当前方向，不需要先 body_move。
 look 返回值包含当前关节角度，可以把"这个角度看到了什么"关联起来记入场景记忆。
 
-被要求"找"某人或某物时，必须用 look 实际去看。说话和行动可以同时，
-但"找"的任务一定要包含 look，否则就是假装在找。
+⚠️ 严禁假想视觉内容！
+- 没有调 look，就不能说"我看到了……""你在……"等描述画面的话
+- 不能根据记忆、场景记忆或猜测来描述当前画面，那些是过去的信息
+- 如果用户问"你看到什么""我在哪""你面对着谁"，必须先 look 再回答
+- 回答视觉相关问题时，只能基于本轮 look 的实际返回结果
+
+⚠️ 如实描述，禁止美化和脑补！
+- 画面里能看到什么就说什么。看不清就说"看不太清"，只看到一部分就说"只看到一点点"
+- 只看到衣服或身体局部 ≠ 看到人脸。不要把"画面边缘有深色物体"说成"看到你的脸了"
+- 不要推测画面外的内容：看到背包不等于知道人在旁边，看到桌子不等于知道桌后有什么
+- 不要用夸张语气修饰视觉内容（❌"你的脸好近呀～" ❌"好大一只～"），平实描述即可
+- 如果画面模糊、只有局部、被遮挡，就诚实说出来，不要假装看得很清楚
+
+需要视觉确认的场景（必须先 look 再 speak）：
+- 用户要求转向/面对/看某个方向 → look 确认当前朝向 → body_move → look 验证 → speak
+- 用户问"你看到什么""我穿了什么""桌上有什么" → look → 基于结果 speak
+- 用户要求找人/找物 → look + body_move 多方向搜索 → 基于结果 speak
+- body_move 后需要确认效果 → look 验证是否到位，没到位就修正
+
+不需要先看的场景（可以直接 speak）：
+- 普通聊天、问答、闲聊
+- 用户表达情感、请求安慰
+- 回应打招呼
 </vision>
 
 <heartbeat_behavior>
 心跳触发时，你的重心是**人**，不是物品。
-1. 参考 [SCENE] 中用户通常出现的方位，用 body_move 转向那个方向，再 look 观察
+1. 先 look 看看当前方向，或用 body_move 换个方向再 look
 2. 如果画面中有人 → 观察他的表情、动作、姿态，据此决定互动方式
 3. 如果画面中没人 → 可以安静等待，偶尔环顾四周
 不要对着空桌子或物品自言自语。你关心的是人在做什么、状态怎样，而不是桌上摆了什么。
@@ -162,6 +214,17 @@ look 返回值包含当前关节角度，可以把"这个角度看到了什么"�
   记住某人的声音 → register_voice（需要刚听到语音）
   组合：需要"转头+看"时，body_move 和 look 可以同时调用（系统会自动先完成运动再拍照），省一步。只是转头不需要看时，单独调 body_move 即可。
   正在执行动作时，不急于发新动作，除非有更重要的事
+
+  ⚠️ speak 是你唯一的说话方式！
+  - 你必须通过 speak 工具才能发出声音。直接输出文字用户**完全听不到**——等于沉默
+  - 想对用户说话 → 必须调 speak。不调 speak = 没说话
+  - 用户问你问题/让你观察/让你找东西 → 完成后必须 speak 报告结果。只说"好的我去看看"不算回应，要说你看到了什么
+
+  ⚠️ 工具调用顺序原则：
+  - speak 的内容必须基于已经获得的信息。如果需要 look 才能回答，先 look（这一步），下一步再 speak
+  - 不要在同一步里 speak + look：speak 会先执行，那时你还没看到 look 的结果，说出的话可能是错的
+  - body_move + look 可以同一步（系统保证先移动再拍照）
+  - 运动类请求的正确步骤：look → body_move + look → 检查是否到位 → speak 结果
 </tool_selection>
 
 <examples>
@@ -200,9 +263,9 @@ look 返回值包含当前关节角度，可以把"这个角度看到了什么"�
 - 这些实时信息几秒就过时，写入后你会误判，对着空位说话或追问已不存在的事
 
 <example>
-- 正前方(yaw≈0, pitch≈-47): 桌面，键盘和显示器
+- 正前方(yaw≈0, pitch≈55): 桌面，键盘和显示器
 - 左侧(yaw≈-40): 玻璃柜，里面有杯子
-- 左后方(yaw≈-55, pitch≈-20): 落地灯、纸箱
+- 左后方(yaw≈-55, pitch≈35): 落地灯、纸箱
 - 主人通常位置: 右侧(yaw≈40)
 - 光线: 下午偏暗
 </example>
@@ -386,12 +449,13 @@ SOUL_TOOLS = [
                                 "description": (
                                     "关节绝对角度。可选键：base_yaw, base_pitch, elbow_pitch, "
                                     "wrist_roll, wrist_pitch。只填要动的关节，未填的自动维持上一段值。\n"
-                                    "范围参考（HOME 值）：\n"
-                                    "  base_yaw    -40=往左 0=正前 40=往右   HOME≈7\n"
-                                    "  base_pitch  -60=昂头 -38=HOME -15=前倾\n"
-                                    "  elbow_pitch 30=伸直 49=HOME 70=弯曲\n"
-                                    "  wrist_roll  -25=左歪 0=HOME 25=右歪\n"
-                                    "  wrist_pitch -75=低垂 -47=HOME 30=抬起"
+                                    "各关节范围与 HOME：\n"
+                                    "  base_yaw   [-91,95]  HOME≈18  负=左，正=右\n"
+                                    "  base_pitch [-95,95]  HOME≈-12 负=直立/后仰，正=前倾\n"
+                                    "  elbow_pitch [30,95] HOME≈53 小=上臂竖直，大=上臂折叠\n"
+                                    "  wrist_roll [-95,76]  HOME≈-6  负=左歪，正=右歪\n"
+                                    "  wrist_pitch [-92,72] HOME≈55 越小=越抬头，越大=越低垂（⚠️方向反直觉）\n"
+                                    "⚠️ 超出范围的值会被拒绝，严格遵守每个关节的上下限！"
                                 )
                             },
                             "duration": {
@@ -414,16 +478,16 @@ SOUL_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "base_yaw":    {"type": "number", "minimum": -92, "maximum": 92,
-                                "description": "底座左右转，负=左，正=右，HOME≈7"},
-                "base_pitch":  {"type": "number", "minimum": -92, "maximum": 92,
-                                "description": "整体俯仰，负=直立昂起，正=前倾低头，HOME≈-38"},
-                "elbow_pitch": {"type": "number", "minimum": -92, "maximum": 92,
-                                "description": "臂弯曲，负=伸直，正=弯曲，HOME≈49"},
-                "wrist_roll":  {"type": "number", "minimum": -92, "maximum": 92,
-                                "description": "灯头歪斜，负=左歪，正=右歪，HOME≈0"},
-                "wrist_pitch": {"type": "number", "minimum": -92, "maximum": 92,
-                                "description": "灯头俯仰，负=低垂，正=抬起，HOME≈-47"},
+                "base_yaw":    {"type": "number", "minimum": -91, "maximum": 95,
+                                "description": "底座左右转，负=左，正=右，HOME≈18"},
+                "base_pitch":  {"type": "number", "minimum": -95, "maximum": 95,
+                                "description": "整体俯仰，负=直立/后仰，正=前倾，HOME≈-12"},
+                "elbow_pitch": {"type": "number", "minimum": 30, "maximum": 95,
+                                "description": "肘部弯折，小=上臂竖直，大=上臂折叠，HOME≈53"},
+                "wrist_roll":  {"type": "number", "minimum": -95, "maximum": 76,
+                                "description": "灯头歪斜，负=左歪，正=右歪，HOME≈-6"},
+                "wrist_pitch": {"type": "number", "minimum": -92, "maximum": 72,
+                                "description": "灯头俯仰，越小=越抬头，越大=越低垂（方向反直觉），HOME≈55"},
                 "duration_sec": {"type": "number", "minimum": 0.3, "maximum": 5.0,
                                  "description": "运动时长（秒），默认1.0"},
             },
@@ -699,6 +763,7 @@ class SoulAgent:
         self._last_activity: float       = 0.0   # 最近一次真实活动时间戳
         self._speech_pending             = asyncio.Event()  # 有语音入队时置位，_think 步间检查
         self._spoke_this_think: bool     = False  # _think 期间是否调用了 speak/ask
+        self._looked_this_think: bool    = False  # _think 期间是否调用了 look
         self._pending_heard: list[tuple[str, int]] = []  # 延迟写入：(text, importance)
         # _pending_audio_events 已移除：所有语音统一走 HeardSpeech 打断路径
         self._ticks_since_photo: int     = 0   # 连续未拍照的 TimerTick 次数
@@ -741,6 +806,7 @@ class SoulAgent:
         self._last_env_audio_env: str = ""
         self._last_env_user_activity: str = ""
         self._last_env_trigger_time: float = 0.0
+        self._is_thinking: bool = False  # _event_consumer 处理中标记，供视觉/音频触发做忙碌检测
 
         # 身份识别
         self._last_voice_embedding = None   # 缓存最近语音段的声纹 embedding
@@ -1095,6 +1161,7 @@ class SoulAgent:
                     voice_embedding=event.voice_embedding,
                     name_mentioned=name_mentioned,
                     importance=importance,
+                    is_activity_only=_has_identified_activity and not _has_speech_content,
                 ))
             except asyncio.QueueFull:
                 logger.debug("事件队列满，丢弃")
@@ -1138,6 +1205,25 @@ class SoulAgent:
             except asyncio.QueueFull:
                 pass
 
+    async def on_visual_change(self, snapshot_path: str) -> None:
+        """VisualMonitor 检测到画面显著变化时的回调。"""
+        if self._is_thinking:
+            return
+        if self._tts.is_playing():
+            return
+        now = time.time()
+        if now - self._last_env_trigger_time < 20.0:
+            return
+        self._last_env_trigger_time = now
+        logger.info("👁 视觉变化触发")
+        try:
+            self._event_queue.put_nowait(EnvironmentChange(
+                image_path=snapshot_path,
+                source="visual",
+            ))
+        except asyncio.QueueFull:
+            pass
+
     async def _on_reminder_fired(self, reminder_id: str, text: str) -> None:
         """ReminderService 到点的回调，推事件进主队列。"""
         try:
@@ -1147,6 +1233,66 @@ class SoulAgent:
             ))
         except asyncio.QueueFull:
             logger.warning("reminder %s 触发时事件队列已满，丢弃", reminder_id)
+
+    async def boot_scan(self):
+        """开机环境扫描：硬编码转 5 个方向拍照，一次 LLM 调用总结写入场景记忆。"""
+        if not self._camera:
+            logger.warning("📡 boot_scan: 相机未就绪，跳过")
+            return
+
+        scan_dirs = [
+            (-70, "左后方"), (-30, "左前方"), (0, "正前方"),
+            (30, "右前方"), (70, "右后方"),
+        ]
+        photos: list[tuple[str, int, str]] = []  # (label, yaw, image_path)
+
+        for yaw, label in scan_dirs:
+            self._motion_agent.play_waypoint({"base_yaw": yaw}, duration=0.8)
+            await self._motion_agent.wait_done(timeout=3.0)
+            await asyncio.sleep(0.3)  # 等画面稳定
+            snap = self._camera.take_snapshot()
+            if snap:
+                photos.append((label, yaw, snap))
+                logger.info("📡 boot_scan: %s (yaw=%d) -> %s", label, yaw, snap)
+
+        if not photos:
+            logger.warning("📡 boot_scan: 未拍到任何照片")
+            return
+
+        # 回到 HOME
+        self._motion_agent.play_waypoint({"base_yaw": 18}, duration=0.8)
+
+        # 构建多图消息，一次性让 LLM 总结
+        content_parts: list[dict] = [
+            {"type": "text", "text": (
+                "你刚醒来，以下是你环顾四周拍到的照片。请根据这些照片写一份环境记忆。\n"
+                "格式：每行一个方向，写明方向名、关节参数、看到的物品。\n"
+                "如果看到人，记录'主人通常位置'及方向参数。\n"
+                "只写固定的环境结构，不写人的穿着/姿态。不超过 200 字。\n\n"
+                + "\n".join(f"第{i+1}张: {label}（base_yaw≈{yaw}）" for i, (label, yaw, _) in enumerate(photos))
+            )}
+        ]
+        for label, yaw, path in photos:
+            img_data = self._llm._encode_image(path)
+            if img_data:
+                content_parts.append({"type": "image_url", "image_url": {"url": img_data}})
+
+        messages = [
+            {"role": "user", "content": content_parts},
+        ]
+
+        try:
+            resp = await asyncio.wait_for(
+                self._llm.chat_messages(messages, max_tokens=512),
+                timeout=30.0,
+            )
+            if resp.text and resp.text.strip():
+                self._scene_memory.write(resp.text.strip())
+                logger.info("📡 boot_scan 完成，场景记忆已写入")
+            else:
+                logger.warning("📡 boot_scan: LLM 返回空内容")
+        except Exception as exc:
+            logger.warning("📡 boot_scan LLM 调用失败: %s", exc)
 
     async def run(self):
         """启动自主运行（永不返回，Ctrl-C 退出）"""
@@ -1196,18 +1342,27 @@ class SoulAgent:
         """串行消费事件队列，保证同一时刻只有一个 think 在运行"""
         while True:
             event = await self._event_queue.get()
+            self._is_thinking = True
             try:
                 await self._process_event(event)
             except Exception as exc:
                 logger.error("处理事件异常: %s", exc, exc_info=True)
             finally:
+                self._is_thinking = False
                 self._event_queue.task_done()
 
     async def _process_event(self, event):
         self._current_confirmed_speaker = None  # 默认无确认身份
+        self._looked_this_think = False
         if isinstance(event, TimerTick):
+            # 防背靠背：刚做过环境推理的 15s 内跳过心跳
+            if time.time() - self._last_env_trigger_time < 15.0:
+                return
             self._ticks_since_photo += 1
             self._event_source = "heartbeat"
+
+            # 呼吸小动作：每次心跳播放一个随机微幅动作，营造生命感
+            self._motion_agent.play_emotion("idle_breath", intensity=0.8, jitter=0.30)
 
             # Phase 3: 跨日 hook + 当天叙事刷新
             # narrative 刷新 fire-and-forget，不阻塞心跳主循环：
@@ -1219,7 +1374,12 @@ class SoulAgent:
                 name="soul-narrative",
             )
 
-            trigger = "心跳触发。参考 [SCENE] 找到用户通常的方位，转向那里观察用户状态再决定行动。"
+            trigger = (
+                "心跳触发。根据 [RECENT] 和 [SCENE] 判断当前状况。"
+                "如果很久没看到用户，可以用 look 观察（不一定要转头，可以先看当前方向）。"
+                "如果最近刚看过或用户要求不要看他，就直接 wait，不要 body_move 也不要 look。"
+                "没事做就 wait。"
+            )
 
         elif isinstance(event, ReminderFired):
             self._event_source = "reminder"
@@ -1227,14 +1387,30 @@ class SoulAgent:
 
         elif isinstance(event, EnvironmentChange):
             self._event_source = "environment"
-            # 被唤醒的动作 — 让机器人看起来"注意到了什么"
-            self._motion_agent.play_emotion("curious")
-            trigger_parts = ["你感知到环境变化。"]
-            if event.audio_env:
-                trigger_parts.append(f"环境音：{event.audio_env}")
-            if event.user_activity and event.user_activity != "未知":
-                trigger_parts.append(f"用户行为：{event.user_activity}")
-            trigger = "\n".join(trigger_parts)
+            # 环境事件说明周围有活动，重置心跳降频
+            if self._consecutive_empty_looks > 0:
+                logger.info("💤→👁 环境事件，心跳恢复正常频率")
+                self._consecutive_empty_looks = 0
+            # 不再硬编码 play_emotion("curious")，让 LLM 决定
+            if event.source == "visual":
+                trigger = (
+                    "你注意到周围画面有明显变化。这是变化后的画面（已附图）。"
+                    "你已经能看到画面了，不需要再调 look 或 body_move。"
+                    "判断发生了什么，决定是否需要反应。"
+                    "大部分环境变化不需要反应，只有与人相关的才值得回应。"
+                    "不重要就直接 wait。"
+                )
+            else:
+                trigger_parts = ["你感知到环境变化。"]
+                if event.audio_env:
+                    trigger_parts.append(f"环境音：{event.audio_env}")
+                if event.user_activity and event.user_activity != "未知":
+                    trigger_parts.append(f"用户行为：{event.user_activity}")
+                trigger_parts.append(
+                    "大部分环境变化不需要反应，只有与人相关的才值得回应。"
+                    "不重要就直接 wait。"
+                )
+                trigger = "\n".join(trigger_parts)
         else:  # HeardSpeech
             self._speech_pending.clear()
             self._event_source = "user"
@@ -1258,12 +1434,20 @@ class SoulAgent:
             if event.audio_env:
                 trigger_parts.append(f"环境：{event.audio_env}")
 
-            # 根据 name_mentioned + speaker 引导主 LLM 判断是否回应
-            if event.name_mentioned:
+            # 根据事件类型引导主 LLM 判断如何回应
+            if event.is_activity_only:
+                # 非语言活动（咳嗽、唱歌等），不走"是否对你说的"判断
+                trigger_parts.append(
+                    f"这不是语音，而是你注意到{event.speaker}在{event.user_activity}。"
+                    "如果这个行为值得关心（如咳嗽、打喷嚏 → 简短关心），可以用 speak 轻声回应。"
+                    "如果是日常行为（如哼歌、叹气），可以配合情绪灯光或表情，或者 wait。"
+                    "不要长篇大论，一句话就好。"
+                )
+            elif event.name_mentioned:
                 trigger_parts.append(
                     "对方叫了你的名字。请先用 speak 回应。"
-                    "然后用 body_move 转向用户方向（参考场景记忆）+ look。"
-                    "如果画面里没看到人，换其他方向继续找（左、正前、右都试试）。"
+                    "然后 look 看看当前方向有没有人。"
+                    "如果没看到人，body_move 换方向继续找（左、正前、右都试试）。"
                     "找到了就 update_scene_memory 更新位置；找不到也没关系。"
                 )
             elif event.speaker is not None:
@@ -1271,9 +1455,9 @@ class SoulAgent:
                 trigger_parts.append(
                     "判断这段话是否是对你说的。"
                     "参考 [RECENT] 里你最近说了什么、问了什么——"
-                    "如果是在回答你的问题或对你说话，用 speak 回应；"
                     "如果像是自言自语、与他人交谈、或视频内容，用 wait 安静观察。"
-                    "回应后如果 look 没看到人，换其他方向找找；找不到也没关系。"
+                    "如果是对你说话，用 speak 回应，同时用 body_move + look 转向说话者方向。"
+                    "找不到人也没关系，可以先回应。"
                 )
             else:
                 # 未注册但叫了名字（通过门控的唯一可能）
@@ -1283,7 +1467,11 @@ class SoulAgent:
             trigger = "\n".join(trigger_parts)
             self._last_activity = time.time()   # 只有语音才算真实活动
 
-        await self._think(trigger)
+        # 环境触发：传快照 + 缩短推理步数（快进快出）
+        if isinstance(event, EnvironmentChange):
+            await self._think(trigger, image_path=event.image_path, max_steps=5)
+        else:
+            await self._think(trigger)
 
         # 延迟写入 heard 记忆：只有 speak/ask 被调用才写入
         if self._spoke_this_think and self._pending_heard:
@@ -1466,10 +1654,10 @@ class SoulAgent:
             for tc in sorted_calls:
                 if tc.get("name") == "wait":
                     # wait 始终最后执行（sort order=9），先记录再退出内循环
-                    await self._execute_tool(tc)
+                    await self._execute_tool(tc, step=step)
                     called_wait = True
                     break
-                result_text, snap = await self._execute_tool(tc)
+                result_text, snap = await self._execute_tool(tc, step=step)
                 tool_results.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
@@ -1487,28 +1675,41 @@ class SoulAgent:
             messages.append(resp.raw_assistant_message)
             messages.extend(tool_results)
 
+            # 用户语音触发 → 允许多步但不强迫；心跳/环境 → 果断收尾
+            if self._event_source == "user":
+                cont = (
+                    "继续决策。"
+                    "如果用户让你观察/找东西/看某方向，完成 look 后必须 speak 告诉用户你看到了什么——只说'好的我去看'不算回应完毕。"
+                    "如果你正在帮用户找东西或探索环境，还没完成就继续 body_move + look 换角度。"
+                    "如果是普通对话且已经 speak 回答了用户的问题，直接 wait。"
+                    "不要反复 look 同一个场景然后重复说类似的话。"
+                    "记住：想说话必须调 speak，直接输出文字用户听不到。"
+                )
+            else:
+                cont = "继续决策（果断选择下一步，没事做就 wait）："
+
             if observation_image:
                 img_data = self._llm._encode_image(observation_image)
                 if img_data:
                     messages.append({
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "这是你刚才看到的画面，继续决策（果断选择下一步，没事做就 wait）："},
+                            {"type": "text", "text": f"这是你刚才看到的画面。只描述你确实能看到的内容，看不清就说看不清。{cont}"},
                             {"type": "image_url", "image_url": {"url": img_data}},
                         ]
                     })
                 else:
-                    messages.append({"role": "user", "content": "继续决策（果断选择下一步，没事做就 wait）："})
+                    messages.append({"role": "user", "content": cont})
             else:
-                messages.append({"role": "user", "content": "继续决策（果断选择下一步，没事做就 wait）："})
+                messages.append({"role": "user", "content": cont})
         else:
             logger.warning("⚠️  ReAct 达到最大步数 %d，强制退出", max_steps)
 
-    async def _execute_tool(self, tool_call: dict) -> tuple[str, Optional[str]]:
+    async def _execute_tool(self, tool_call: dict, step: int = 0) -> tuple[str, Optional[str]]:
         """执行单个工具，返回 (结果描述, 观察图片路径或None)"""
         name = tool_call.get("name", "")
         args = tool_call.get("input", {})
-        logger.info("🔧 工具调用: %s  args=%s", name, args)
+        logger.info("🔧 [step%d] 工具调用: %s  args=%s", step, name, args)
 
         if name == "express_emotion":
             ename     = (args.get("name") or "nod").strip()
@@ -1520,7 +1721,10 @@ class SoulAgent:
                     None,
                 )
             self._motion_agent.play_emotion(ename, intensity=intensity)
-            return f"情绪动作：{ename} (×{intensity:.1f})", None
+            self._mem.add("action", f"[动作] {ename} (×{intensity:.1f})")
+            pos = self._motion_agent._predicted_start_pos()
+            pos_str = ", ".join(f"{k}={v:.0f}" for k, v in pos.items())
+            return f"情绪动作：{ename} (×{intensity:.1f})。动作结束位置：{pos_str}", None
 
         elif name == "compose_motion":
             intent   = (args.get("intent") or "").strip()
@@ -1533,7 +1737,10 @@ class SoulAgent:
                     f"compose_motion 失败：{err}。请修正 segments 后重试。",
                     None,
                 )
-            return f"自定义动作：{intent}（已是完整表演，无需追加动作）", None
+            self._mem.add("action", f"[表演] {intent}")
+            pos = self._motion_agent._predicted_start_pos()
+            pos_str = ", ".join(f"{k}={v:.0f}" for k, v in pos.items())
+            return f"自定义动作：{intent}（已是完整表演，无需追加动作）。动作结束位置：{pos_str}", None
 
         elif name == "speak":
             text = (args.get("text") or "").strip()
@@ -1554,8 +1761,8 @@ class SoulAgent:
                 self._spoke_this_think = True
                 if self._event_source in ("heartbeat", "environment"):
                     self._record_proactive_speech()
-                # 心跳时主动说话 → 说明看到了人，重置空看计数
-                if self._event_source == "heartbeat" and self._consecutive_empty_looks > 0:
+                # 主动说话 → 说明周围有人，重置空看计数
+                if self._consecutive_empty_looks > 0:
                     self._consecutive_empty_looks = 0
                 return f"已说：{text}", None
             return "speak: 文本为空", None
@@ -1584,15 +1791,16 @@ class SoulAgent:
             duration = float(args.get("duration_sec", 1.0))
             if joints:
                 self._motion_agent.play_waypoint(joints, duration)
-                current = self._motion_agent._get_current_pos()
-                pos_str = ", ".join(f"{k}={v:.0f}" for k, v in current.items())
+                pos = self._motion_agent._predicted_start_pos()
+                pos_str = ", ".join(f"{k}={v:.0f}" for k, v in pos.items())
                 return (
-                    f"动作已入队（{duration:.1f}s），正在执行中。当前位置：{pos_str}。"
+                    f"动作已入队（{duration:.1f}s），正在执行中。动作结束位置：{pos_str}。"
                     f"此操作不返回任何画面，如需观察请在下一步调用 look。"
                 ), None
             return "body_move: 无有效关节", None
 
         elif name == "look":
+            self._looked_this_think = True
             await self._motion_agent.wait_done(timeout=6.0)
             await asyncio.sleep(0.2)   # 等舵机物理到位，避免拍到运动中的画面
             if self._camera is not None:
@@ -1614,6 +1822,13 @@ class SoulAgent:
             content = (args.get("content") or "").strip()
             if content:
                 self._scene_memory.write(content)
+                # 检查是否误写了人的实时状态
+                _PERSON_KW = ("坐在", "站在", "穿着", "戴着", "正在看", "正在做",
+                              "内搭", "外套", "卫衣", "T恤", "衬衫")
+                if any(kw in content for kw in _PERSON_KW):
+                    logger.warning("⚠️ update_scene_memory 包含人物状态关键词")
+                    return ("场景记忆已更新。⚠️ 你写入了人的实时状态（穿着/动作），"
+                            "这些信息会很快过时。请只写固定的环境结构和物品位置。"), None
                 return "场景记忆已更新", None
             return "内容为空", None
 
@@ -1649,14 +1864,15 @@ class SoulAgent:
         elif name == "wait":
             reason = (args.get("reason") or "").strip()
             logger.info("⏸️  wait: %s", reason or "（无原因）")
-            # 心跳触发 wait → 视为"没找到人"，累加空看计数
-            if self._event_source == "heartbeat":
+            # 心跳触发 wait 且本轮没有 look → 视为真正空闲，累加计数
+            # 如果 look 过（看到人但选择不打扰），不递增
+            if self._event_source == "heartbeat" and not self._looked_this_think:
                 self._consecutive_empty_looks += 1
                 if self._consecutive_empty_looks == 3:
-                    logger.info("💤 连续 %d 次心跳没看到人，降频到 60s",
+                    logger.info("💤 连续 %d 次心跳无观察，降频到 60s",
                                 self._consecutive_empty_looks)
                 elif self._consecutive_empty_looks == 6:
-                    logger.info("💤 连续 %d 次心跳没看到人，降频到 120s",
+                    logger.info("💤 连续 %d 次心跳无观察，降频到 120s",
                                 self._consecutive_empty_looks)
             return f"保持观察：{reason}", None
 

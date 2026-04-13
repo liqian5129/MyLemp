@@ -62,9 +62,11 @@ class MotionAgent:
         self._frames:      list[dict]     = []
         self._frame_idx:   int            = 0
         self._next_frames: Optional[list[dict]] = None
+        self._last_sent_pos: Optional[dict] = None   # 最后发给舵机的目标位置
 
         # Idle 状态
         self._idle_hold_until: float = 0.0   # 保持期截止时间戳（期间完全静止）
+        self._last_motion_end: float = 0.0   # 上次 playing→idle 的时间戳
 
         self._attitude: float = 0.0
 
@@ -90,6 +92,9 @@ class MotionAgent:
 
         current = self._get_current_pos()
         self._idle_hold_until = 0.0
+        # 把当前编码器位置写回 Goal_Position，防止 enable_torque 后
+        # 舵机跳向上次关机前的旧 Goal
+        self._send_pos(current)
         logger.info(
             "📐 启动角度  yaw=%.1f pitch=%.1f elbow=%.1f roll=%.1f wrist=%.1f",
             current["base_yaw"], current["base_pitch"], current["elbow_pitch"],
@@ -166,12 +171,19 @@ class MotionAgent:
         with self._lock:
             return self._mode == "playing"
 
+    def last_motion_end_time(self) -> float:
+        """上次运动结束的时间戳（time.time()）。未运动过返回 0。"""
+        with self._lock:
+            return self._last_motion_end
+
     def get_status_str(self) -> str:
-        """返回当前运动状态描述，注入 think prompt"""
+        """返回当前运动状态描述（含关节角度），注入 think prompt"""
+        pos = self._predicted_start_pos()
+        pos_str = " ".join(f"{k}={v:.0f}" for k, v in pos.items())
         with self._lock:
             if self._mode == "playing":
-                return "正在执行动作中（如无必要勿打断）"
-            return "空闲，可以自由运动"
+                return f"执行动作中｜{pos_str}"
+            return f"空闲｜{pos_str}"
 
     def play_waypoint(self, joints: dict, duration: float = 1.0):
         """直接从关节目标值生成帧并入队，无需 LLM。
@@ -255,6 +267,7 @@ class MotionAgent:
                         with self._lock:
                             self._mode            = "idle"
                             self._idle_hold_until = time.time() + IDLE_HOLD_SEC
+                            self._last_motion_end = time.time()
                         logger.debug("▶ playing→idle  hold=%.0fs", IDLE_HOLD_SEC)
             else:
                 self._run_idle_step(t_wall)
@@ -324,7 +337,9 @@ class MotionAgent:
         - 若当前在 playing：返回当前 frames 的最后一帧
           （新动作会替换 pending，最终接在当前 frames 之后；
           以 frames 末尾为起点才能保证位置连续，避免动作衔接处跳变）
-        - 若 idle：读真实编码器（保留漂移恢复路径）
+        - 若 idle 且有 _last_sent_pos：返回最后发送的目标位置
+          （避免编码器漂移导致新动作起点与舵机内部 Goal 不连续）
+        - 若 idle 且无 _last_sent_pos（首次启动）：读编码器
 
         历史 bug：曾经直接用 _get_current_pos()，主线程读到的是入队"那一刻"的
         编码器值，而下一动作真正播放时编码器已被前一动作改变，导致前一动作 →
@@ -333,7 +348,9 @@ class MotionAgent:
         with self._lock:
             if self._mode == "playing" and self._frames:
                 return dict(self._frames[-1])
-        # 锁外做 IO，避免和 _io_lock 嵌套且不阻塞控制循环
+            if self._last_sent_pos is not None:
+                return dict(self._last_sent_pos)
+        # 首次启动，尚未发过帧 → 读编码器
         return self._get_current_pos()
 
     def _send_pos(self, pos: dict):
@@ -343,6 +360,7 @@ class MotionAgent:
             if self.robot is not None:
                 with self._io_lock:
                     self.robot.send_action(action)
+                self._last_sent_pos = dict(pos)
         except Exception as exc:
             logger.warning("send_action 失败: %s", exc)
 

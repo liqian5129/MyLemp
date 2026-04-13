@@ -37,6 +37,7 @@ from lelamp.soul.camera_capture import CameraCapture
 from lelamp.soul.memory import HistoryDB, IdentityMemory, MemoryStream, LongTermMemory
 from lelamp.soul.omni_ear import OmniEar
 from lelamp.soul.soul_agent import SoulAgent
+from lelamp.soul.visual_monitor import VisualMonitor
 from lelamp.tts.doubao_speaker import DoubaoTTSPlayer
 from lelamp.utils import find_serial_port
 
@@ -79,6 +80,13 @@ async def main():
             model=os.environ.get("KIMI_MODEL", "kimi-k2.5"),
             base_url="https://api.moonshot.cn/v1",
             enable_thinking=os.environ.get("KIMI_THINKING", "").lower() in ("1", "true", "yes"),
+        )
+    elif llm_provider == "openrouter":
+        llm = AIClient(
+            provider="openrouter",
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            model=os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4"),
+            base_url="https://openrouter.ai/api/v1",
         )
     else:
         raise ValueError(f"不支持的 LLM_PROVIDER: {llm_provider}")
@@ -178,6 +186,14 @@ async def main():
     camera.start()
     agent.set_camera(camera)
 
+    # ── 视觉变化检测 ──────────────────────────────────────────────────────────
+    visual_monitor = VisualMonitor(
+        camera=camera,
+        motion_agent=motion_svc,
+        on_change=agent.on_visual_change,
+    )
+    visual_monitor.start()
+
     # ── 智能耳朵（OmniEar：本地 VAD + HTTP Omni）────────────────────────────
     ear = OmniEar(
         api_key=os.environ.get("DASHSCOPE_API_KEY"),
@@ -187,13 +203,16 @@ async def main():
     )
     ear.on_event = agent.on_audio_event
 
-    # AEC：TTS 播放时进入 barge-in 模式，用户说话可打断
+    # AEC：TTS 播放时静音麦克风，播放结束恢复
     tts.on_play_start = ear.mute
     tts.on_play_end = ear.unmute
-    ear.on_barge_in = tts.interrupt
 
     await ear.start()
     await tts.speak("呼——我醒来了。")
+
+    # ── 开机环境扫描 ──────────────────────────────────────────────────────────
+    logger.info("📡 开始开机环境扫描")
+    await agent.boot_scan()
 
     logger.info("小Q 智能耳朵系统已启动（Ctrl-C 退出）")
 
@@ -203,6 +222,7 @@ async def main():
         logger.info("收到退出信号")
     finally:
         await agent.shutdown()
+        visual_monitor.stop()
         camera.stop()
         await ear.stop()
         await tts.stop()

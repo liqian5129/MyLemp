@@ -87,16 +87,14 @@ class OmniEar:
         self._audio_chunks: list[bytes] = []
         self._lock = threading.Lock()
 
-        # Barge-in：TTS 播放时不完全静音，而是提高阈值检测用户打断
-        self._barge_in_mode = False
-        self._barge_in_multiplier = 3.0  # barge-in 阈值 = 正常阈值 × 此倍数
+        # TTS 播放时完全静音（不收音）
+        self._muted = False
 
         self._stream: Optional[sd.InputStream] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # 外部回调
         self.on_event: Optional[Callable[[AudioEvent], Coroutine]] = None
-        self.on_barge_in: Optional[Callable[[], None]] = None  # 用户打断 TTS 时触发
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
@@ -158,16 +156,16 @@ class OmniEar:
         logger.info("OmniEar 已停止")
 
     def mute(self) -> None:
-        """TTS 播放时调用：进入 barge-in 检测模式（提高阈值，检测用户打断）。"""
-        self._barge_in_mode = True
+        """TTS 播放时调用：完全静音，丢弃正在收集的音频。"""
+        self._muted = True
         with self._lock:
             if self._state == _VADState.COLLECTING:
                 self._state = _VADState.IDLE
                 self._audio_chunks.clear()
 
     def unmute(self) -> None:
-        """TTS 播放结束后调用：退出 barge-in 模式，恢复正常监听。"""
-        self._barge_in_mode = False
+        """TTS 播放结束后调用：恢复正常监听。"""
+        self._muted = False
 
     # ── 噪底校准 ──────────────────────────────────────────────────────────────
 
@@ -202,25 +200,11 @@ class OmniEar:
     # ── 音频回调（sounddevice 线程）────────────────────────────────────────────
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
-        rms = float(np.sqrt(np.mean(indata ** 2)))
-
-        # Barge-in 模式：TTS 播放中，用提高的阈值检测用户是否在说话
-        if self._barge_in_mode:
-            barge_threshold = self._threshold * self._barge_in_multiplier
-            if rms > barge_threshold:
-                logger.info("Barge-in: 检测到用户说话 (rms=%.4f, threshold=%.4f)", rms, barge_threshold)
-                self._barge_in_mode = False
-                pcm = (indata * 32767).astype(np.int16).tobytes()
-                now = time.monotonic()
-                with self._lock:
-                    self._state = _VADState.COLLECTING
-                    self._audio_chunks = [pcm]
-                    self._last_voice_t = now
-                    self._collect_start = now
-                if self.on_barge_in and self._loop:
-                    self._loop.call_soon_threadsafe(self.on_barge_in)
+        # TTS 播放中完全静音，丢弃所有音频
+        if self._muted:
             return
 
+        rms = float(np.sqrt(np.mean(indata ** 2)))
         pcm = (indata * 32767).astype(np.int16).tobytes()
         now = time.monotonic()
 
@@ -304,6 +288,7 @@ class OmniEar:
                     event.text, event.emotion, event.intent, event.directed,
                     event.audio_env, event.user_activity, event.speaker,
                 )
+
                 if self.on_event and (event.text or event.audio_env):
                     await self.on_event(event)
             except Exception as exc:
