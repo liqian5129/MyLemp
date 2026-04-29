@@ -1,0 +1,23 @@
+{
+  "name": "wake_me_up",
+  "intent": "",
+  "start_pose": {
+    "base_yaw": 60.36,
+    "base_pitch": -8.05,
+    "elbow_pitch": 55.23,
+    "wrist_roll": 8.44,
+    "wrist_pitch": 63.49
+  },
+  "segments": [
+    {
+      "joints": {
+        "base_yaw": 74.27,
+        "base_pitch": 73.35,
+        "elbow_pitch": 66.78,
+        "wrist_roll": 6.57,
+        "wrist_pitch": -8.93
+      },
+      "duration": 2.0
+    }
+  ]
+}
