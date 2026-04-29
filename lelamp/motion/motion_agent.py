@@ -141,6 +141,46 @@ class MotionAgent:
             name, intensity, len(frames),
         )
 
+    def play_keyframes(self, segments: list, intent: str = "") -> Optional[str]:
+        """播放手动录制的关键帧序列（record_keyframe 产物）。
+
+        与 play_compose 的区别：跳过 compose_motion.validate_segments 里
+        给 LLM 设的数量/时长上限（MAX_SEG_COUNT=12, MAX_TOTAL_DUR=8）。
+        保留关节限位（_build_frames 内 _clamp）和速度安全审计（_velocity_audit）。
+        """
+        if not isinstance(segments, list) or not segments:
+            return "segments 为空"
+        seg_list: list[tuple[dict, float]] = []
+        for idx, seg in enumerate(segments):
+            if not isinstance(seg, dict):
+                return f"段 {idx} 不是 dict"
+            joints = seg.get("joints", {})
+            dur    = seg.get("duration")
+            if not isinstance(joints, dict) or not joints:
+                return f"段 {idx} joints 缺失"
+            try:
+                dur = float(dur)
+            except (TypeError, ValueError):
+                return f"段 {idx} duration 不合法"
+            if dur <= 0:
+                return f"段 {idx} duration={dur} 必须 > 0"
+            clean = {k: float(v) for k, v in joints.items() if k in _JOINT_KEYS}
+            if not clean:
+                return f"段 {idx} 无有效关节"
+            seg_list.append((clean, dur))
+
+        current = self._predicted_start_pos()
+        frames  = _build_frames(current, seg_list)
+        if not frames:
+            return "生成的帧序列为空"
+        frames = self._velocity_audit(frames)
+        self._enqueue_frames(frames)
+        logger.info(
+            "🎞️ play_keyframes: %s  %d kfs → %d frames",
+            (intent or "")[:30], len(seg_list), len(frames),
+        )
+        return None
+
     def play_compose(self, intent: str, segments: list) -> Optional[str]:
         """compose_motion 工具入口：LLM 直接给出 segments 列表。
         返回错误字符串（用于回报 LLM）或 None（成功）。

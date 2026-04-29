@@ -74,7 +74,7 @@ async def main():
     motion_svc = MotionAgent(port=port, lamp_id="lelamp", fps=30)
     motion_svc.start()
     if os.environ.get("MOTION_RECORD", "").lower() in ("1", "true", "yes"):
-        motion_svc.start_recording("motion_record.csv")
+        motion_svc.start_recording("data/motion_record.csv")
 
     # ── RGB 服务 ──────────────────────────────────────────────────────────────
     rgb_svc = RGBService(

@@ -289,7 +289,7 @@ sudo uv run main.py download-files
 sudo uv run main.py console
 
 # For Smooth Animation Mode
-sudo uv run smooth_animation.py console
+sudo uv run scripts/smooth_animation.py console
 ```
 
 In case your lamp is not `lelamp`, change the id of the lamp inside main.py:
