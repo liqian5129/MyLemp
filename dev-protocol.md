@@ -41,6 +41,9 @@
 | `set_text` | 设置文字区内容 | `id`(string), `text`(string) | — |
 | `show_prompt` | 显示审批 prompt(attention 状态用) | `tool`(string), `command`(string), `id`(string) | `desc`(string,补充说明) |
 | `set_brightness` | 屏幕亮度 | `value`(0-100) | — |
+| `set_session_pips` | 多 session 状态点(屏角) | `pips`(array) | — |
+| `set_activity_log` | 底部活动日志 strip | `entries`(array of string) | — |
+| `set_tokens` | 今日累计 tokens 数字 | `today`(整数) | — |
 
 ### 2.2 设备 → Mac(事件 / Event,ack / Ack)
 
@@ -199,6 +202,105 @@
 
 ---
 
+### 3.7 `set_session_pips`(v0.3.0)
+
+**Mac 发送**:
+```json
+{"cmd":"set_session_pips","pips":[
+  {"sid":"abc12345","state":"busy","winner":true},
+  {"sid":"xyz67890","state":"attention","winner":false}
+]}
+```
+
+**设备回**:
+```json
+{"ack":"set_session_pips","ok":true}
+```
+
+**字段**:
+- `pips[]` —— 数组,长度 0-N,每次**全量替换**(非增量)
+- `pips[].sid` —— session 标识(可截断显示前 4-8 字符,或纯当 unique key)
+- `pips[].state` —— 取值跟 `set_state` 一致(`idle`/`busy`/`attention`/`failed`/`celebrate`/`sleep`)
+- `pips[].winner` —— bool,有且仅有一个 `true`(当前主导 session)
+
+**特殊**:`pips: []` 表示无 active session,屏角清空。
+
+**用途**:多终端 Claude Code 并发时,屏角加 N 个状态点呈现所有 active session 的状态(主屏视觉走 winner)。Mac daemon 在 N≥2 时下发,N≤1 时不下发(或下发空 list 清屏)。
+
+**视觉规则**(参考实现,Agent B 决定细节):
+- 位置:屏右上角,从右到左排列,2px 间距
+- winner 圆点 8px 实心 + 2px 描边;非 winner 6px 实心
+- 颜色按 `dev-implementation-plan.md` §2 / §7.2 调色板
+- 最多展示 6 个;超过显示 5 个 + "5+" 数字标
+- 进入 attention(任一点变橙)时整体闪烁一次
+
+**与 `set_state` 的关系**:**两套独立信号,叠加呈现**。设备收到 `set_state` 不应清掉屏角点;反之亦然。
+
+---
+
+### 3.8 `set_activity_log`(v0.4.0)
+
+**Mac 发送**:
+```json
+{"cmd":"set_activity_log","entries":[
+  "edit auth.ts: replaced bcrypt with argon2",
+  "> read main.cpp:124-156",
+  "user: 怎么测试"
+]}
+```
+
+**设备回**:
+```json
+{"ack":"set_activity_log","ok":true}
+```
+
+**字段**:
+- `entries[]` —— 字符串数组,长度 0-8;**全量替换**(非增量)
+- `entries[0]` 是**最新**事件,后续依时间倒序;设备渲染时最新行高亮 INK,前几行 dim
+- 单行 ≤ 80 字节(UTF-8);超出 Mac 端必须截断后再发
+- `entries: []` 表示清空 strip
+
+**频率约束**:
+- Mac 端必须做 debounce(建议 ≥200ms),不允许每个 tool 调用都打一次;rapid 序列只发终态
+- 设备保持上次内容直到下一次命令(无超时清空)
+
+**可见性**(设备侧规则,参考):
+- 仅在 `idle` / `busy` / `sleep` 状态显示
+- `attention` / `failed` / `celebrate` 隐藏(底部留给按钮 / 主视觉)
+
+---
+
+### 3.9 `set_tokens`(v0.4.0)
+
+**Mac 发送**:
+```json
+{"cmd":"set_tokens","today":12400}
+```
+
+**设备回**:
+```json
+{"ack":"set_tokens","ok":true}
+```
+
+**字段**:
+- `today` —— 非负整数,**当前日历日**(local 0:00 起)的累计 token 数
+
+**累计口径**(Mac 端):
+- 来自 Claude Code transcript JSONL(`~/.claude/projects/<encoded-cwd>/*.jsonl`)
+- 对所有 `type=assistant` 消息求和:`input_tokens + cache_creation_input_tokens + cache_read_input_tokens + output_tokens`
+- 范围:仅本项目(daemon 启动 cwd 对应的 projects 目录),跨项目不合并
+- 跨日 0:00 重置
+
+**频率约束**:
+- Mac 端节流:累计变化 ≥100 tokens **或** 距上次推送 ≥30s 才发
+- 跨日清零时立即推 `today=0`
+
+**设备侧展示**(参考):
+- 屏右下角 11pt 灰字 "12.4K tokens"
+- 单位:<10000 显示一位小数 K(`12.4K`),≥10000 显示整数 K(`123K`),≥1M 显示 M(`1.2M`)
+
+---
+
 ## 4. 事件详细规范
 
 ### 4.1 `evt: ready`
@@ -336,6 +438,8 @@ Mac 端探测到 USB CDC 设备后,**重新发**:
 | 0.2.0 | 2026-04-26 | 新增 `failed` state(任务失败/出错,不自动回 idle,视觉上区别于 attention) |
 | 0.2.1 | 2026-04-29 | celebrate 自动回 idle 时长由 1.5s 调整为 3s(实测动画播放不充分) |
 | 0.2.2 | 2026-04-29 | celebrate 时长 3s → 4s(用户实测 3s 仍偏短) |
+| 0.3.0 | 2026-04-29 | 新增 `set_session_pips` 命令(多终端 Claude Code 并发时屏角状态点) |
+| 0.4.0 | 2026-05-02 | 新增 `set_activity_log`(底部事件流 strip)与 `set_tokens`(今日累计)两个命令;无 breaking change |
 
 未来变更**必须**:
 - 单调递增版本号

@@ -19,6 +19,20 @@ ERROR_DISPLAY_TTL = 30.0   # failed 状态展示时长(秒);超时 daemon 主动
 CELEBRATE_DURATION = 4.0   # celebrate 持续时长(秒);Mac 派生窗口,给设备动画充分播放
 SLEEP_THRESHOLD = 300.0    # 5 分钟无信号 → sleep
 
+# 多 session 聚合 ───────────────────────────────────────────────────────────
+# 优先级:数值越大越占主导;winner 由此排序得出
+STATE_PRIORITY = {
+    "failed":    5,
+    "attention": 4,
+    "celebrate": 3,
+    "busy":      2,
+    "idle":      1,
+    "sleep":     0,
+}
+SESSION_IDLE_TTL = 900.0   # 15 分钟无活动的 session 视为 abandoned 自动 GC
+                           # (Claude Code 终端被 Ctrl-C / 关掉时 SessionEnd 不一定触发,
+                           # 用绝对超时兜底,避免屏角 ghost 点)
+
 
 @dataclass(frozen=True)
 class Prompt:
@@ -94,3 +108,41 @@ def derive_state(snap: SessionSnapshot, now: Optional[float] = None) -> str:
 def initial_snapshot() -> SessionSnapshot:
     """daemon 启动时的初始 snapshot:idle 状态。"""
     return SessionSnapshot(last_updated=time.monotonic())
+
+
+def aggregate_state(
+    sessions: dict[str, SessionSnapshot],
+    now: Optional[float] = None,
+) -> tuple[str, Optional[str]]:
+    """聚合 N 个 session 派生 (winning_state, winning_session_id)。
+
+    规则:
+      - 每个 session 各自 derive_state,取**优先级最高**的那个
+      - 同优先级时,**last_updated 最新者胜**(最近活跃)
+      - 空 dict / 全 None → ("idle", None)
+
+    用于 multi-terminal Claude Code:多个会话并发时,屏只能呈现一个状态,
+    选最重要的(failed > attention > celebrate > busy > idle > sleep)。
+    """
+    if not sessions:
+        return ("idle", None)
+    if now is None:
+        now = time.monotonic()
+
+    best_sid: Optional[str] = None
+    best_state: str = "idle"
+    best_priority: int = -1
+    best_last_updated: float = -1.0
+
+    for sid, snap in sessions.items():
+        state = derive_state(snap, now)
+        priority = STATE_PRIORITY.get(state, 0)
+        if priority > best_priority or (
+            priority == best_priority and snap.last_updated > best_last_updated
+        ):
+            best_sid = sid
+            best_state = state
+            best_priority = priority
+            best_last_updated = snap.last_updated
+
+    return (best_state, best_sid)

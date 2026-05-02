@@ -71,11 +71,16 @@ class CompanionHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         assert _machine is not None
         if self.path == "/state":
-            snap = _machine.get_snapshot()
+            from lelamp.companion.snapshot import aggregate_state
+            sessions = _machine.get_sessions()
+            agg_state, winner_sid = aggregate_state(sessions)
+            winning_snap = sessions.get(winner_sid) if winner_sid else _machine.get_snapshot()
             self._send(200, {
                 "ok": True,
-                "state": derive_state(snap),
-                "snapshot": _snapshot_to_dict(snap),
+                "state": agg_state,
+                "winner_sid": winner_sid,
+                "snapshot": _snapshot_to_dict(winning_snap),  # 向后兼容:winning 那个
+                "sessions": {sid: _snapshot_to_dict(s) for sid, s in sessions.items()},
             })
         elif self.path == "/health":
             self._send(200, {"ok": True})
@@ -99,6 +104,14 @@ class CompanionHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.exception("handle_update 异常")
                 self._send(500, {"ok": False, "error": str(e)})
+        elif self.path == "/reset":
+            # 手动清掉所有非 _default 的 session(用于关终端但 SessionEnd 没触发的情况)
+            try:
+                n = _machine.reset_sessions()
+                self._send(200, {"ok": True, "removed": n})
+            except Exception as e:
+                logger.exception("handle_reset 异常")
+                self._send(500, {"ok": False, "error": str(e)})
         elif self.path == "/shutdown":
             self._send(200, {"ok": True})
             # 让主线程退出 serve_forever
@@ -111,73 +124,126 @@ class CompanionHandler(BaseHTTPRequestHandler):
 # 事件处理(canonical event → snapshot mutation)
 # ──────────────────────────────────────────────────────────────────────────
 
+def _summarize_tool_input(tool: str, tinput: dict) -> str:
+    """把 tool_input 抽成一行短摘要,用于 activity log。
+
+    各 tool 字段不同,挑最有信息量的一个。截到 60 字节。
+    """
+    if not isinstance(tinput, dict):
+        return ""
+    if tool == "Bash":
+        cmd = tinput.get("command", "")
+        return cmd[:60]
+    if tool in ("Read", "NotebookEdit"):
+        return str(tinput.get("file_path", ""))[-60:]
+    if tool in ("Edit", "Write"):
+        return str(tinput.get("file_path", ""))[-60:]
+    if tool == "Glob":
+        return str(tinput.get("pattern", ""))[:60]
+    if tool == "Grep":
+        return str(tinput.get("pattern", ""))[:60]
+    if tool == "WebFetch":
+        return str(tinput.get("url", ""))[:60]
+    if tool == "WebSearch":
+        return str(tinput.get("query", ""))[:60]
+    # 通用 fallback
+    for k in ("description", "prompt", "command", "file_path", "pattern", "url"):
+        v = tinput.get(k)
+        if v:
+            return str(v)[:60]
+    return ""
+
+
 def handle_event(machine: SessionStateMachine, body: dict) -> dict:
-    """canonical event → snapshot mutation。返回 HTTP body dict。"""
+    """canonical event → snapshot mutation。返回 HTTP body dict。
+
+    所有事件按 body.session_id 路由到对应 session;无 sid 落 _default 桶。
+    顺便把"人类可读"的事件摘要 push 进全局 activity log ring。
+    """
     event_type = body.get("type")
     data = body.get("data") or {}
+    sid = body.get("session_id") or None
 
     if event_type == "agent_session_start":
         # 新 session 起来 → 清 msg(给 task_started 落 session topic 让位)
-        machine.mutate(running=False, msg="")
+        machine.mutate(session_id=sid, running=False, msg="")
         return {"ok": True, "decision": None}
 
     if event_type == "task_started":
-        # 新任务开始:清残留 prompt / error / completed_at
-        # **session topic 粘性**:msg 只在当前为空时落地(session 内第一个 prompt),
-        # 后续 prompts 不覆盖,屏 subtitle 在整个 session 维持同一句 topic
-        current_msg = machine.get_snapshot().msg
-        new_summary = data.get("summary", "")
-        sticky_msg = current_msg if current_msg else new_summary
-
+        # 新任务开始:msg 显示**最新 prompt 的前 40 字符**(覆盖,不再粘性)
+        # 清残留 prompt / error / completed_at
+        summary = data.get("summary", "")
         machine.mutate(
+            session_id=sid,
             running=True,
             completed_at=None,
             current_tool=None,
             elapsed_ms=0,
-            msg=sticky_msg,
+            msg=summary,
             prompt=None,
             error=None,
         )
+        if summary:
+            machine.add_activity(f"user: {summary}")
         return {"ok": True, "decision": None}
 
     if event_type == "tool_started":
+        # 关键:清 prompt(若审批已通过,attention 应回 busy)
+        tool = data.get("tool", "")
         machine.mutate(
-            current_tool=data.get("tool"),
-            msg=data.get("summary", machine.get_snapshot().msg),
+            session_id=sid,
+            current_tool=tool,
+            prompt=None,
         )
+        if tool:
+            arg = _summarize_tool_input(tool, data.get("tool_input") or {})
+            line = f"{tool}: {arg}" if arg else tool
+            machine.add_activity(line)
         return {"ok": True, "decision": None}
 
     if event_type == "tool_completed":
-        machine.mutate(current_tool=None)
+        machine.mutate(session_id=sid, current_tool=None)
         return {"ok": True, "decision": None}
 
     if event_type == "task_completed":
         # 任务结束:清 prompt(用户已经处理完了),触发 celebrate → idle
-        machine.mutate(running=False, completed_at=time.monotonic(), prompt=None)
+        machine.mutate(
+            session_id=sid,
+            running=False,
+            completed_at=time.monotonic(),
+            prompt=None,
+        )
+        machine.add_activity("✓ done")
         return {"ok": True, "decision": None}
 
     if event_type == "task_failed":
-        err = Error(
-            msg=data.get("msg", "Unknown error"),
-            timestamp=time.monotonic(),
-        )
-        machine.mutate(error=err, running=False)
+        msg = data.get("msg", "Unknown error")
+        err = Error(msg=msg, timestamp=time.monotonic())
+        machine.mutate(session_id=sid, error=err, running=False)
+        machine.add_activity(f"✗ {msg}")
         return {"ok": True, "decision": None}
 
     if event_type == "agent_session_end":
-        machine.mutate(running=False)
+        # 优先显式移除 session;无 sid 时仅 mutate 默认桶
+        if sid:
+            machine.remove_session(sid)
+        else:
+            machine.mutate(session_id=None, running=False)
         return {"ok": True, "decision": None}
 
     if event_type == "awaiting_approval":
         prompt_id = data.get("id") or f"prompt_{int(time.monotonic() * 1000)}"
+        tool = data.get("tool", "unknown")
+        cmd = data.get("command", "")
         prompt = Prompt(
             id=prompt_id,
-            tool=data.get("tool", "unknown"),
-            command=data.get("command", ""),
+            tool=tool,
+            command=cmd,
             hint=data.get("hint"),
         )
         # snapshot 加 prompt → 派生为 attention → 下发 set_state attention + show_prompt
-        machine.mutate(prompt=prompt)
+        machine.mutate(session_id=sid, prompt=prompt)
+        machine.add_activity(f"⚠ needs you: {tool} {cmd}"[:80])
 
         # blocking 模式(默认 false):
         #   - false(Notification hook 用):set prompt 即返回,屏保持 attention,
@@ -190,7 +256,7 @@ def handle_event(machine: SessionStateMachine, body: dict) -> dict:
             prompt_id=prompt_id,
             timeout=APPROVAL_TIMEOUT_SEC,
         )
-        machine.mutate(prompt=None)
+        machine.mutate(session_id=sid, prompt=None)
         return {"ok": True, "decision": decision}
 
     return {"ok": False, "error": f"unknown event type: {event_type}"}
@@ -200,11 +266,13 @@ def handle_update(machine: SessionStateMachine, body: dict) -> None:
     """直接 merge partial snapshot(供调试 / 兼容 Anthropic snapshot 转发)。
 
     白名单字段;未识别的字段静默忽略。
+    可带 session_id;不带则落 _default 桶。
     """
+    sid = body.get("session_id") or None
     allowed = {"running", "msg", "tokens_today", "current_tool", "elapsed_ms"}
     changes = {k: v for k, v in body.items() if k in allowed}
     if changes:
-        machine.mutate(**changes)
+        machine.mutate(session_id=sid, **changes)
 
 
 def _snapshot_to_dict(snap: SessionSnapshot) -> dict:
@@ -289,12 +357,24 @@ def main() -> int:
     _machine = SessionStateMachine(disp, arm)
     _machine.start()
 
+    # ---- 启动 transcript watcher(协议 v0.4.0:今日 tokens)----
+    from lelamp.companion.transcript_watcher import (  # noqa: E402
+        TranscriptWatcher,
+        encode_cwd_to_project_dir,
+    )
+    import os
+    cwd = os.getcwd()
+    project_dir = Path.home() / ".claude" / "projects" / encode_cwd_to_project_dir(cwd)
+    watcher = TranscriptWatcher(project_dir, on_tokens_change=_machine.set_tokens_today)
+    watcher.start()
+
     # ---- 启动 HTTP server ----
     server = ThreadingHTTPServer(("127.0.0.1", args.port), CompanionHandler)
     log.info("Daemon 监听 http://127.0.0.1:%d", args.port)
     log.info("  GET  /state    查 snapshot + 派生 state")
     log.info("  POST /event    canonical event 入口")
     log.info("  POST /update   partial snapshot patch")
+    log.info("  POST /reset    手动清掉所有非默认 session(屏角清屏)")
     log.info("  POST /shutdown 优雅关闭")
 
     exit_code = 0
@@ -307,6 +387,10 @@ def main() -> int:
         exit_code = 1
     finally:
         server.server_close()
+        try:
+            watcher.stop()
+        except Exception:
+            log.exception("transcript watcher stop 异常")
         try:
             _machine.stop()
         except Exception:

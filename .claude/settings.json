@@ -34,6 +34,17 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/qliau/playground/lelamp_runtime/lelamp/companion/hooks/claude_code/pre_tool_use.sh",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "Notification": [
       {
         "hooks": [

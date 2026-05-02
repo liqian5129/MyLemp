@@ -8,7 +8,7 @@
   - 命令发送 fire-and-forget,不阻塞主线程
   - mock 模式:不连真硬件,把发出的 JSON 打印,模拟 ack
 
-协议版本:v0.2.0(含 failed state)
+协议版本:v0.4.0(含 set_activity_log / set_tokens)
 """
 from __future__ import annotations
 
@@ -151,6 +151,39 @@ class DisplayController:
 
     def set_brightness(self, value: int) -> None:
         self._send({"cmd": "set_brightness", "value": int(value)})
+
+    def set_session_pips(self, pips: list) -> None:
+        """多 session 状态点(协议 v0.3.0)。
+
+        pips: list[{"sid": str, "state": str, "winner": bool}],可为空 list 清空。
+        每次全量替换(非增量)。Mac daemon 在多 session 并发时下发。
+        """
+        self._send({"cmd": "set_session_pips", "pips": list(pips)})
+
+    def set_activity_log(self, entries: list) -> None:
+        """底部活动日志 strip(协议 v0.4.0)。
+
+        entries: list[str],长度 0-8,entries[0] 最新;每条 ≤80 字节(超出截断)。
+        全量替换。Mac daemon 在事件流变化时节流推送(≥200ms debounce)。
+        """
+        # 80 字节硬性截断,避免设备解析炸
+        clean = []
+        for e in entries[:8]:
+            s = str(e)
+            b = s.encode("utf-8")
+            if len(b) > 80:
+                # 截到 80 字节,但要落在 utf-8 char 边界
+                s = b[:80].decode("utf-8", errors="ignore")
+            clean.append(s)
+        self._send({"cmd": "set_activity_log", "entries": clean})
+
+    def set_tokens(self, today: int) -> None:
+        """今日累计 tokens(协议 v0.4.0)。
+
+        today: 非负整数,当前日历日累计 token 数(含 cache)。
+        Mac daemon 节流:变化 ≥100 或 ≥30s 才推。
+        """
+        self._send({"cmd": "set_tokens", "today": max(0, int(today))})
 
     def send_raw(self, payload: dict) -> None:
         """直接发送任意 payload(供测试 / 自定义命令用)。
