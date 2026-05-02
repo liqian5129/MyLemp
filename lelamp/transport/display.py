@@ -190,8 +190,12 @@ class DisplayController:
         跟其他命令方法一样 fire-and-forget,绕过任何客户端校验。"""
         self._send(payload)
 
+    # 关键命令打 INFO log,便于诊断设备渲染问题;高频命令走 DEBUG 避免刷屏
+    _LOG_INFO_CMDS = {"set_state", "show_prompt", "set_brightness", "set_session_pips"}
+
     def _send(self, payload: dict) -> None:
         line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n"
+        cmd = payload.get("cmd", "?")
         if self.mock:
             logger.info("[mock send] %s", line.strip())
             self._mock_response(payload)
@@ -199,6 +203,11 @@ class DisplayController:
         with self._send_lock:
             assert self._serial is not None, "DisplayController 未 start"
             self._serial.write(line.encode("utf-8"))
+        # 写完打 log(在锁外,避免阻塞)
+        if cmd in self._LOG_INFO_CMDS:
+            logger.info("→ send %s %s", cmd, json.dumps({k: v for k, v in payload.items() if k != "cmd"}, ensure_ascii=False))
+        else:
+            logger.debug("→ send %s", cmd)
 
     # ---------- 事件订阅 ----------
 
@@ -283,6 +292,20 @@ class DisplayController:
         self._dispatch(msg)
 
     def _dispatch(self, msg: dict) -> None:
+        # 设备 → Mac 入站可见性 log
+        evt = msg.get("evt")
+        ack = msg.get("ack")
+        ok = msg.get("ok")
+        if evt:
+            logger.info("← recv evt=%s %s", evt, json.dumps({k: v for k, v in msg.items() if k != "evt"}, ensure_ascii=False))
+        elif ack:
+            if ok is False:
+                logger.warning("← recv ack=%s FAIL %s", ack, msg.get("error", ""))
+            elif ack in self._LOG_INFO_CMDS:
+                logger.info("← recv ack=%s ok", ack)
+            else:
+                logger.debug("← recv ack=%s ok", ack)
+
         # 先入队(给 sync facade),再调回调(异步订阅者)
         try:
             self._event_queue.put_nowait(msg)
