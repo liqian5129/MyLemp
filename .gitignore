@@ -17,3 +17,6 @@ wheels/
 tmp/*
 logs/
 snapshots/
+
+# macOS
+.DS_Store

@@ -70,7 +70,7 @@ def mode_watch(robot):
         print("\n👋 退出")
 
 
-def mode_record(robot, path="joint_record.csv", interval=0.05):
+def mode_record(robot, path="data/joint_record.csv", interval=0.05):
     """录制模式：以 ~20Hz 采样，写入 CSV"""
     print(f"✅ 录制中 → {path}  (采样率 ~{1/interval:.0f}Hz，Ctrl-C 停止)\n")
     t0 = time.perf_counter()
