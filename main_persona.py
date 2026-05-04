@@ -1,30 +1,43 @@
 """
-小Q persona 模式入口(协议 v0.5.0,在 main_soul.py 基础上加表情驱动)
+小Q persona 模式入口(协议 v0.5.0,在 main_dual.py 基础上加表情驱动)
 
-跟 main_soul.py 的差异:
+跟 main_dual.py 的差异:
   - 接 FaceDirector,通过 buddy daemon HTTP /face /arc 路由驱动设备表情
-  - 用户语音 → 关键词触发 arc(早安/晚安/难过等)
-  - 在 LLM 输出中识别 face 标签 → set_face
+  - 用户语音 → 关键词触发 arc(早安/晚安/难过等),wrap agent.on_audio_event
+  - SoulAgent 注入 face 标签提示,LLM 在每段说话尾部带 <face>name</face>
+  - tts.speak patch:朗读前解析标签 → set_face,朗读时 strip 标签
 
 依赖:
   - buddy daemon 必须在跑(持 USB,转发 face/arc 命令到设备)
   - 长按屏左下角切到 buddy 模式时,设备暂停渲染 face;切回 persona 立即恢复
 
 运行:
-    # 终端 1:启动 daemon
+    # 终端 1:启动 daemon(持 USB,接 cc hooks,转发 /face /arc)
     uv run python -m lelamp.companion --no-arm
 
     # 终端 2:启动 persona
     uv run python main_persona.py
 
-环境变量(与 main_soul.py 相同,复用 .env):
-    KIMI_API_KEY / KIMI_MODEL / DOUBAO_TTS_*
-    LELAMP_DAEMON_URL    可选,默认 http://127.0.0.1:9000
+环境变量(沿用 main_dual.py):
+    KIMI_API_KEY           必填  — SoulAgent LLM
+    KIMI_MODEL             可选,默认 kimi-k2.5
+    DASHSCOPE_API_KEY      必填  — Qwen Omni HTTP
+    EMBEDDING_API_KEY      可选  — 长期记忆向量搜索
+    REVIEW_LLM_API_KEY     可选  — Background Review 独立 API key
+    REVIEW_LLM_MODEL       可选
+    DOUBAO_TTS_APPID       必填
+    DOUBAO_TTS_TOKEN       必填
+    DOUBAO_TTS_CLUSTER     可选,默认 volcano_tts
+    DOUBAO_TTS_VOICE_TYPE  可选
+    DOUBAO_TTS_EMOTION     可选,默认 happy
+    OMNI_SILENCE_SEC       可选,默认 1.2  — VAD 静默截断时长
+    AUDIO_INPUT_DEVICE     可选  — 麦克风设备 ID
+    LELAMP_DAEMON_URL      可选,默认 http://127.0.0.1:9000
 """
 import asyncio
 import logging
 import os
-from logging.handlers import RotatingFileHandler
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -34,19 +47,18 @@ from lelamp.motion.motion_agent import MotionAgent
 from lelamp.persona import FaceDirector
 from lelamp.service.rgb.rgb_service import RGBService
 from lelamp.soul.camera_capture import CameraCapture
-from lelamp.soul.continuous_listener import ContinuousListener
-from lelamp.soul.memory import MemoryStream
+from lelamp.soul.memory import HistoryDB, IdentityMemory, MemoryStream, LongTermMemory
+from lelamp.soul.omni_ear import OmniEar
 from lelamp.soul.soul_agent import SoulAgent
+from lelamp.soul.visual_monitor import VisualMonitor
 from lelamp.tts.doubao_speaker import DoubaoTTSPlayer
 from lelamp.utils import find_serial_port
-from lelamp.voice.funasr_asr import create_local_asr
 
 load_dotenv()
 
-# face 标签规则:让 LLM 在每段说话(speak/ask 工具的 text/question 字段)
-# 末尾附加 <face>name</face> 标签,FaceDirector 解析它驱动设备表情。
-# 这段拼到 SoulAgent.PERSONALITY_PROMPT 末尾,只在 main_persona 入口生效,
-# main_soul 完全不受影响。
+# face 标签规则:让 LLM 在每段说话(speak/ask 工具)尾部附加 <face>name</face>。
+# 拼到 SoulAgent.PERSONALITY_PROMPT 末尾,只在 main_persona 入口生效,
+# main_soul / main_dual 完全不受影响。
 _PERSONA_FACE_PROMPT = """\
 <face_expression>
 你能用屏幕上的表情同步表达情绪。在每段说话**结尾**(无论是 speak 还是 ask
@@ -78,12 +90,8 @@ _fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s")
 _console = logging.StreamHandler()
 _console.setFormatter(_fmt)
 
-_file = RotatingFileHandler(
-    _LOG_DIR / "soul.log",
-    maxBytes=5 * 1024 * 1024,   # 5 MB per file
-    backupCount=5,
-    encoding="utf-8",
-)
+_log_file = _LOG_DIR / f"persona_{datetime.now():%Y%m%d_%H%M%S}.log"
+_file = logging.FileHandler(_log_file, encoding="utf-8")
 _file.setFormatter(_fmt)
 
 logging.basicConfig(level=logging.INFO, handlers=[_console, _file])
@@ -92,18 +100,69 @@ logger = logging.getLogger(__name__)
 
 async def main():
     port = find_serial_port()
-    logger.info("🔌 串口: %s", port)
+    logger.info("串口: %s", port)
 
-    # ── LLM 客户端（运动 + 灵魂共用）────────────────────────────────────────
-    llm = AIClient(
-        provider="kimi",
-        api_key=os.environ["KIMI_API_KEY"],
-        model=os.environ.get("KIMI_MODEL", "kimi-k2.5"),
-        base_url="https://api.moonshot.cn/v1",
-        enable_thinking=os.environ.get("KIMI_THINKING", "").lower() in ("1", "true", "yes"),
-    )
+    # ── LLM 客户端 ────────────────────────────────────────────────────────────
+    llm_provider = os.environ.get("LLM_PROVIDER", "kimi").lower()
 
-    # ── 运动服务（Motion Agent）──────────────────────────────────────────────
+    if llm_provider == "qwen":
+        llm = AIClient(
+            provider="qwen",
+            api_key=os.environ["QWEN_API_KEY"],
+            model=os.environ.get("QWEN_MODEL", "qwen3.6-plus"),
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+    elif llm_provider == "kimi":
+        llm = AIClient(
+            provider="kimi",
+            api_key=os.environ["KIMI_API_KEY"],
+            model=os.environ.get("KIMI_MODEL", "kimi-k2.5"),
+            base_url="https://api.moonshot.cn/v1",
+            enable_thinking=os.environ.get("KIMI_THINKING", "").lower() in ("1", "true", "yes"),
+        )
+    elif llm_provider == "openrouter":
+        llm = AIClient(
+            provider="openrouter",
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            model=os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4"),
+            base_url="https://openrouter.ai/api/v1",
+        )
+    else:
+        raise ValueError(f"不支持的 LLM_PROVIDER: {llm_provider}")
+
+    # ── Background Review LLM 客户端(独立,不阻塞主对话)─────────────────────
+    # 默认交叉 provider:主 qwen → review kimi,主 kimi → review qwen
+    review_api_key = os.environ.get("REVIEW_LLM_API_KEY", "")
+    if review_api_key:
+        review_llm = AIClient(
+            provider=llm_provider,
+            api_key=review_api_key,
+            model=os.environ.get("REVIEW_LLM_MODEL", llm.model),
+            base_url=llm.base_url,
+        )
+    elif llm_provider == "qwen" and os.environ.get("KIMI_API_KEY"):
+        review_llm = AIClient(
+            provider="kimi",
+            api_key=os.environ["KIMI_API_KEY"],
+            model=os.environ.get("REVIEW_LLM_MODEL", "kimi-k2.5"),
+            base_url="https://api.moonshot.cn/v1",
+        )
+    elif llm_provider == "kimi" and os.environ.get("QWEN_API_KEY"):
+        review_llm = AIClient(
+            provider="qwen",
+            api_key=os.environ["QWEN_API_KEY"],
+            model=os.environ.get("REVIEW_LLM_MODEL", "qwen3.6-plus"),
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+    else:
+        review_llm = AIClient(
+            provider=llm_provider,
+            api_key=llm.api_key,
+            model=llm.model,
+            base_url=llm.base_url,
+        ) if llm.api_key else None
+
+    # ── 运动服务 ──────────────────────────────────────────────────────────────
     motion_svc = MotionAgent(port=port, lamp_id="lelamp", fps=30)
     motion_svc.start()
     if os.environ.get("MOTION_RECORD", "").lower() in ("1", "true", "yes"):
@@ -139,7 +198,8 @@ async def main():
     face_director = FaceDirector(daemon_url=daemon_url)
     logger.info("🎭 FaceDirector 接 daemon: %s", daemon_url)
 
-    # 包装 tts.speak:拦截 LLM 输出 → 解析 <face>...</face> 触发 set_face → 朗读前 strip 标签
+    # 包装 tts.speak:拦截 LLM 输出 → 解析 <face>...</face> 触发 set_face
+    # → 朗读前 strip 标签
     _orig_speak = tts.speak
 
     async def speak_with_face(text, *args, **kwargs):
@@ -149,68 +209,100 @@ async def main():
 
     tts.speak = speak_with_face
 
-    # ── 记忆 + 智能体 ─────────────────────────────────────────────────────────
-    mem   = MemoryStream()
-    mem.start()   # 启动后台防抖写盘
+    # ── 身份识别 + 记忆 + 智能体 ────────────────────────────────────────────────
+    identity_mem = IdentityMemory()
+
+    # SQLite 会话历史(首次启动时迁移旧 archive)
+    history_db = HistoryDB()
+    archive_path = Path.home() / ".lelamp" / "memories.archive.json"
+    if archive_path.exists():
+        migrated = history_db.migrate_from_archive(archive_path)
+        if migrated > 0:
+            logger.info("📦 已迁移 %d 条历史到 SQLite", migrated)
+
+    mem = MemoryStream(history_db=history_db)
+    mem.start()
+    ltm = LongTermMemory(api_key=os.environ.get("EMBEDDING_API_KEY", ""))
     agent = SoulAgent(
         motion_svc, rgb_svc, tts, mem, llm,
+        identity_memory=identity_mem,
+        longterm_memory=ltm,
+        review_llm=review_llm,
+        history_db=history_db,
         personality_prompt_extra=_PERSONA_FACE_PROMPT,
     )
 
-    # 包装 on_speech:用户语音先过关键词 arc 触发,再走原 SoulAgent 处理
-    _orig_on_speech = agent.on_speech
-
-    async def on_speech_with_face(text: str):
-        face_director.maybe_arc_from_user_text(text)
-        await _orig_on_speech(text)
-
-    agent.on_speech = on_speech_with_face
-
-    # ── 开机动作：wake_up 在最轻负载下执行（ASR/摄像头均未启动）────────────────
+    # ── 开机动作 ──────────────────────────────────────────────────────────────
     motion_svc.play_emotion("wake_up")
     rgb_svc.dispatch("solid", (180, 180, 255))
-    face_director.play_arc("morning")  # 表情走 morning 剧本(sleep→sleepy→...→warm_smile)
-    await asyncio.sleep(2.2)   # 等 wake_up（2.0s）执行完毕
+    # 临时禁用 play_arc:Agent B 的固件 v0.5.0 在收到 play_arc 命令后会触发 reset
+    # 循环,让 USB CDC 端点失效。改用 set_face 单条命令避开。等 Agent B 修固件
+    # 后再启用 morning/goodnight 剧本。
+    face_director.set_face("warm_smile")  # 起始表情(替代 morning arc)
+    await asyncio.sleep(2.2)
 
-    # ── 摄像头感知（wake_up 结束后再启动）────────────────────────────────────
+    # ── 摄像头 ────────────────────────────────────────────────────────────────
     camera_device = int(os.environ.get("CAMERA_DEVICE", "0"))
     camera_flip = os.environ.get("CAMERA_FLIP", "").lower() in ("1", "true", "yes")
-    camera = CameraCapture(
-        device_id=camera_device,
-        flip=camera_flip,
-    )
+    camera = CameraCapture(device_id=camera_device, flip=camera_flip)
     camera.start()
     agent.set_camera(camera)
 
-    # ── ASR（wake_up 结束后再启动后台加载，避免模型加载与运动争抢 CPU）─────────
-    loop = asyncio.get_running_loop()
-    asr  = create_local_asr()
-    await asyncio.to_thread(asr.wait_ready)   # 等 ASR 加载完成（后台线程，不阻塞循环）
+    # ── 视觉变化检测 ──────────────────────────────────────────────────────────
+    visual_monitor = VisualMonitor(
+        camera=camera,
+        motion_agent=motion_svc,
+        on_change=agent.on_visual_change,
+    )
+    visual_monitor.start()
+
+    # ── 智能耳朵(OmniEar:本地 VAD + HTTP Omni)───────────────────────────────
+    ear = OmniEar(
+        api_key=os.environ.get("DASHSCOPE_API_KEY"),
+        silence_sec=float(os.environ.get("OMNI_SILENCE_SEC", "1.2")),
+        input_device=int(os.environ["AUDIO_INPUT_DEVICE"]) if os.environ.get("AUDIO_INPUT_DEVICE") else None,
+        identity_memory=identity_mem,
+    )
+
+    # 包装 on_audio_event:用户语音先过关键词 arc 触发,再走原 SoulAgent 处理
+    _orig_on_audio = agent.on_audio_event
+
+    async def on_audio_event_with_face(event):
+        if getattr(event, "text", ""):
+            face_director.maybe_arc_from_user_text(event.text)
+        await _orig_on_audio(event)
+
+    ear.on_event = on_audio_event_with_face
+
+    # AEC:TTS 播放时静音麦克风,播放结束恢复
+    tts.on_play_start = ear.mute
+    tts.on_play_end = ear.unmute
+
+    await ear.start()
     await tts.speak("呼——我醒来了。")
 
-    # ── 持续监听（ASR 已就绪，直接启动）─────────────────────────────────────
-    listener = ContinuousListener(
-        asr=asr,
-        on_speech=agent.on_speech,
-        tts=tts,
-        loop=loop,
-    )
-    listener.start()
+    # ── 开机环境扫描 ──────────────────────────────────────────────────────────
+    logger.info("📡 开始开机环境扫描")
+    await agent.boot_scan()
 
-    logger.info("✨ 小Q 灵魂系统已启动（Ctrl-C 退出）")
+    logger.info("✨ 小Q persona 模式已启动(Ctrl-C 退出)")
 
     try:
         await agent.run()
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("👋 收到退出信号")
+        logger.info("收到退出信号")
     finally:
-        face_director.play_arc("goodnight")  # 退场剧本:warm_smile→...→sleep(永停)
+        # 临时禁用 play_arc(同上,Agent B 固件 bug 待修)
+        face_director.set_face("sleep")  # 退场表情(替代 goodnight arc)
+        await agent.shutdown()
+        visual_monitor.stop()
         camera.stop()
-        listener.stop()
+        await ear.stop()
         await tts.stop()
         motion_svc.stop_recording()
         motion_svc.stop()
         rgb_svc.stop()
+        history_db.close()
         face_director.close()
         logger.info("🌙 小Q 已休眠")
 
