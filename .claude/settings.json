@@ -45,6 +45,17 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/qliau/playground/lelamp_runtime/lelamp/companion/hooks/claude_code/post_tool_use.sh",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "Notification": [
       {
         "hooks": [
