@@ -203,11 +203,12 @@ class DisplayController:
         with self._send_lock:
             assert self._serial is not None, "DisplayController 未 start"
             self._serial.write(line.encode("utf-8"))
-        # 写完打 log(在锁外,避免阻塞)
+        # 写完打 log(在锁外,避免阻塞);size 让我们看出突发命令体量,排查 USB CDC 缓冲
+        size = len(line.encode("utf-8"))
         if cmd in self._LOG_INFO_CMDS:
-            logger.info("→ send %s %s", cmd, json.dumps({k: v for k, v in payload.items() if k != "cmd"}, ensure_ascii=False))
+            logger.info("→ send %s (%dB) %s", cmd, size, json.dumps({k: v for k, v in payload.items() if k != "cmd"}, ensure_ascii=False))
         else:
-            logger.debug("→ send %s", cmd)
+            logger.debug("→ send %s (%dB)", cmd, size)
 
     # ---------- 事件订阅 ----------
 
