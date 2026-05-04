@@ -747,12 +747,16 @@ class SoulAgent:
                  identity_memory: Optional[IdentityMemory] = None,
                  longterm_memory=None,
                  review_llm=None,
-                 history_db=None):
+                 history_db=None,
+                 personality_prompt_extra: str = ""):
         self._motion_agent = motion_agent
         self._rgb_svc      = rgb_svc
         self._tts          = tts
         self._mem          = mem
         self._llm          = llm
+        # 入口可注入额外人格 prompt 片段(如 main_persona 加 face 标签规则);
+        # main_soul 不传则空,行为完全不变。
+        self._personality_prompt_extra = personality_prompt_extra
         self._camera       = None   # 由 set_camera() 注入，供 take_photo 工具使用
         self._identity_memory = identity_memory or IdentityMemory()
         self._longterm = longterm_memory  # LongTermMemory，可为 None
@@ -1540,8 +1544,12 @@ class SoulAgent:
         # 构建初始消息列表
         # MOTION_EXAMPLES 拼在 PERSONALITY_PROMPT 之后，作为 compose_motion 的 few-shot
         # 整段固定内容，会被 prompt cache 缓存
+        # personality_prompt_extra 由入口(main_persona)注入,默认空(main_soul 不变)
+        system_content = PERSONALITY_PROMPT + "\n" + MOTION_EXAMPLES
+        if self._personality_prompt_extra:
+            system_content += "\n" + self._personality_prompt_extra
         messages: list[dict] = [
-            {"role": "system", "content": PERSONALITY_PROMPT + "\n" + MOTION_EXAMPLES}
+            {"role": "system", "content": system_content}
         ]
         if image_path:
             img_data = self._llm._encode_image(image_path)

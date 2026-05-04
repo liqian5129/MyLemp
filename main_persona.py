@@ -43,6 +43,33 @@ from lelamp.voice.funasr_asr import create_local_asr
 
 load_dotenv()
 
+# face 标签规则:让 LLM 在每段说话(speak/ask 工具的 text/question 字段)
+# 末尾附加 <face>name</face> 标签,FaceDirector 解析它驱动设备表情。
+# 这段拼到 SoulAgent.PERSONALITY_PROMPT 末尾,只在 main_persona 入口生效,
+# main_soul 完全不受影响。
+_PERSONA_FACE_PROMPT = """\
+<face_expression>
+你能用屏幕上的表情同步表达情绪。在每段说话**结尾**(无论是 speak 还是 ask
+的文本)附加一个表情标签 <face>name</face>,让屏幕上的脸跟你说话同步变化。
+
+格式:`<face>name</face>` 紧贴文本结尾,**不用空格分隔**(避免读出来)。
+
+可选(必须从这 16 个里选,小写下划线):
+- 平静类:neutral / content / warm_smile
+- 关注/惊讶:surprised / focus / idle_watch / peek
+- 倾听/安抚:listen / comfort
+- 调皮/亲昵:wink / smirk / side_eye / blush / love
+- 困倦:sleepy / sleep
+
+举例:
+- "今天过得怎么样?<face>listen</face>"
+- "哇,真厉害!<face>surprised</face>"
+- "嘿嘿,被你发现了<face>blush</face>"
+
+不确定时用 neutral 或 content。**只附标签**,标签里的 `<face>` 符号不会
+被朗读出来 — 系统会在朗读前剥离。
+</face_expression>"""
+
 _LOG_DIR = Path("logs")
 _LOG_DIR.mkdir(exist_ok=True)
 
@@ -112,10 +139,23 @@ async def main():
     face_director = FaceDirector(daemon_url=daemon_url)
     logger.info("🎭 FaceDirector 接 daemon: %s", daemon_url)
 
+    # 包装 tts.speak:拦截 LLM 输出 → 解析 <face>...</face> 触发 set_face → 朗读前 strip 标签
+    _orig_speak = tts.speak
+
+    async def speak_with_face(text, *args, **kwargs):
+        face_director.maybe_face_from_assistant_text(text)
+        cleaned = FaceDirector.strip_face_tag(text)
+        return await _orig_speak(cleaned, *args, **kwargs)
+
+    tts.speak = speak_with_face
+
     # ── 记忆 + 智能体 ─────────────────────────────────────────────────────────
     mem   = MemoryStream()
     mem.start()   # 启动后台防抖写盘
-    agent = SoulAgent(motion_svc, rgb_svc, tts, mem, llm)
+    agent = SoulAgent(
+        motion_svc, rgb_svc, tts, mem, llm,
+        personality_prompt_extra=_PERSONA_FACE_PROMPT,
+    )
 
     # 包装 on_speech:用户语音先过关键词 arc 触发,再走原 SoulAgent 处理
     _orig_on_speech = agent.on_speech
