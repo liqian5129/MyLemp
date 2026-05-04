@@ -94,7 +94,33 @@ class SessionStateMachine:
             target=self._tick_loop, name="companion-tick", daemon=True
         )
         self._tick_thread.start()
+        # 监听设备 boot/重连信号(evt=ready),清下发缓存让下一次 reconcile
+        # 强制重发 set_state / show_prompt / pips,让设备重连后跟上 daemon 状态
+        try:
+            self._disp.on("ready", lambda evt: self._on_device_ready())
+        except Exception:
+            logger.exception("注册 ready 回调失败")
         logger.info("SessionStateMachine 已启动")
+
+    def _on_device_ready(self) -> None:
+        """设备发 evt=ready(boot/重连后)→ 强制重新下发当前状态。
+
+        清掉 _last_dispatched_state / _last_pips_sig / _last_prompt_key /
+        _info_cache 让下一次 _reconcile 视为状态变化,把当前 winner 的 state /
+        prompt / pips / text 全部重发,设备 boot 后能快速恢复。
+        """
+        logger.info("设备 evt=ready → 强制下次 reconcile 重发完整状态")
+        self._last_dispatched_state = None
+        self._last_pips_sig = None
+        self._last_prompt_key = None
+        self._info_cache.clear()
+        self._last_activity_sig = None
+        self._last_tokens_sent = None
+        # 立即触发一次 reconcile(不等下一次 1Hz tick)
+        try:
+            self._reconcile()
+        except Exception:
+            logger.exception("ready 回调 reconcile 异常")
 
     def stop(self) -> None:
         self._stop_event.set()

@@ -88,6 +88,8 @@ class DisplayController:
         self._handlers: dict[str, list[EventCallback]] = {}
         self._handlers_lock = threading.Lock()
         self._send_lock = threading.Lock()
+        self._reconnect_lock = threading.Lock()  # 防多线程并发重连
+        self._reconnecting = False
 
     # ---------- lifecycle ----------
 
@@ -233,8 +235,17 @@ class DisplayController:
             self._mock_response(payload)
             return
         with self._send_lock:
-            assert self._serial is not None, "DisplayController 未 start"
-            self._serial.write(line.encode("utf-8"))
+            if self._serial is None:
+                logger.warning("→ send %s 丢弃:串口未连(reconnect 中?)", cmd)
+                return
+            try:
+                self._serial.write(line.encode("utf-8"))
+            except Exception as e:
+                # 写失败(Errno 6 等)→ 后台触发重连,本次命令丢失
+                # caller(state_machine)在下次 reconcile 自然会重发(若 state 变)
+                logger.warning("→ send %s 写失败,后台重连: %s", cmd, e)
+                threading.Thread(target=self._reconnect_serial, daemon=True).start()
+                return
         # 写完打 log(在锁外,避免阻塞);size 让我们看出突发命令体量,排查 USB CDC 缓冲
         size = len(line.encode("utf-8"))
         if cmd in self._LOG_INFO_CMDS:
@@ -294,14 +305,20 @@ class DisplayController:
             self._stop_event.wait()
             return
 
-        assert self._serial is not None
         buf = b""
         while not self._stop_event.is_set():
+            if self._serial is None:
+                # 没串口(reconnect 失败 / 设备没插),等 stop 或重连
+                time.sleep(0.5)
+                continue
             try:
                 chunk = self._serial.read(READ_CHUNK_BYTES)
-            except Exception:
-                logger.exception("串口读异常")
-                time.sleep(0.5)
+            except Exception as e:
+                # USB CDC fd 失效(Errno 6 Device not configured)等设备异常
+                # → 触发自动重连,避免 daemon 卡死等手工拔插
+                logger.warning("串口读失败,触发重连: %s", e)
+                self._reconnect_serial()
+                buf = b""  # 重连后丢弃残留半帧
                 continue
             if not chunk:
                 continue
@@ -309,6 +326,42 @@ class DisplayController:
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 self._handle_line(line.decode("utf-8", errors="replace"))
+
+    def _reconnect_serial(self) -> None:
+        """USB fd 失效时自动重连。
+        - 用 _reconnect_lock 防并发重连
+        - 用 find_display_port 重找设备路径(可能 USB 重新枚举到不同 path)
+        - 失败时退避重试,直到 stop 或重连成功
+        """
+        with self._reconnect_lock:
+            if self._reconnecting:
+                return  # 已经在重连了
+            self._reconnecting = True
+        try:
+            # close 旧 serial
+            if self._serial is not None:
+                try:
+                    self._serial.close()
+                except Exception:
+                    pass
+                self._serial = None
+
+            import serial
+            backoff = 1.0
+            while not self._stop_event.is_set():
+                try:
+                    new_port = find_display_port()
+                    new_serial = serial.Serial(new_port, DEFAULT_BAUDRATE, timeout=READ_TIMEOUT_SEC)
+                    self.port = new_port
+                    self._serial = new_serial
+                    logger.info("DisplayController 已重连: %s", new_port)
+                    return
+                except Exception as e:
+                    logger.warning("重连失败,%.1fs 后重试: %s", backoff, e)
+                    self._stop_event.wait(backoff)
+                    backoff = min(backoff * 1.5, 10.0)  # 指数退避封顶 10s
+        finally:
+            self._reconnecting = False
 
     def _handle_line(self, line: str) -> None:
         line = line.strip()
