@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 FPS = 30
 
 HOME_POS = {
-    "base_yaw":    17.8,
-    "base_pitch":  -12.2,
-    "elbow_pitch": 52.9,
+    "base_yaw":    14.3,
+    "base_pitch":  -38.4,
+    "elbow_pitch": 61.3,
     "wrist_roll":  -5.5,
-    "wrist_pitch": 54.6,
+    "wrist_pitch": 5.4,
 }
 
 # 实测物理极限 + 5° 安全余量

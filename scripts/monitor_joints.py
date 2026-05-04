@@ -9,10 +9,13 @@
 """
 import sys
 import time
+from pathlib import Path
 
-from lelamp.follower import LeLampFollower, LeLampFollowerConfig
-from lelamp.service.motors.motion_scripts import HOME_POS
-from lelamp.utils import find_serial_port
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lelamp.follower import LeLampFollower, LeLampFollowerConfig  # noqa: E402
+from lelamp.service.motors.motion_scripts import HOME_POS  # noqa: E402
+from lelamp.utils import find_serial_port  # noqa: E402
 
 
 JOINT_NAMES = {

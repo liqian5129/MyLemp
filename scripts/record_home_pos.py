@@ -6,8 +6,13 @@
 按回车后读取当前位置，打印出可直接粘贴到 motion_scripts.py 的 HOME_POS。
 """
 import argparse
+import sys
 import time
-from lelamp.follower import LeLampFollowerConfig, LeLampFollower
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lelamp.follower import LeLampFollowerConfig, LeLampFollower  # noqa: E402
 
 
 def main():
@@ -17,7 +22,10 @@ def main():
     args = parser.parse_args()
 
     robot = LeLampFollower(LeLampFollowerConfig(port=args.port, id=args.id))
-    robot.connect(calibrate=False)
+    # 用 bus.connect 而非 robot.connect,跳过 configure_motors(写 Acceleration
+    # 等寄存器),避免某舵机短暂电压异常时整个流程挂掉。
+    # record_home_pos 只读位置 + 切 torque,不需要 configure。
+    robot.bus.connect()
 
     # 关闭扭矩，让用户自由摆放
     robot.bus.disable_torque()
@@ -38,7 +46,7 @@ def main():
     print("}")
 
     robot.bus.enable_torque()
-    robot.disconnect()
+    robot.bus.disconnect()
     print("\n已断开。")
 
 

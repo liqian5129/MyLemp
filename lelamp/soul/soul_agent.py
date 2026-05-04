@@ -114,10 +114,10 @@ PERSONALITY_PROMPT = """\
 - wrist_pitch/wrist_roll 只影响头部朝向，不改变头的位置
 
 关节范围：
-  base_yaw:    [-91, 95]  HOME≈18
-  base_pitch:  [-95, 95]  HOME≈-12
-  elbow_pitch: [30, 95]   HOME≈53
-  wrist_pitch: [-92, 72]  HOME≈55
+  base_yaw:    [-91, 95]  HOME≈14
+  base_pitch:  [-95, 95]  HOME≈-38
+  elbow_pitch: [30, 95]   HOME≈61
+  wrist_pitch: [-92, 72]  HOME≈5
   wrist_roll:  [-95, 76]  HOME≈-6
 
 运动方式：
@@ -141,7 +141,7 @@ PERSONALITY_PROMPT = """\
   探头看右边：base_yaw 增大 + base_pitch 略增 → 往右前方探出去
   ⚠️ 这些动作是相对 HOME 的方向指引，具体幅度按需调整（10-20°起步）
 
-休息姿态：用户说"自己玩""别看了""去休息""不用管我"等类似意思时，你必须立即用 body_move 回到正前方放松姿态（base_yaw=0, base_pitch=-12, wrist_pitch=55）。不回正就是一直盯着人看，会让用户不舒服。
+休息姿态：用户说"自己玩""别看了""去休息""不用管我"等类似意思时，你必须立即用 body_move 回到正前方放松姿态（base_yaw=0, base_pitch=-38, wrist_pitch=5）。不回正就是一直盯着人看，会让用户不舒服。
 </body>
 
 <vision>
@@ -450,11 +450,11 @@ SOUL_TOOLS = [
                                     "关节绝对角度。可选键：base_yaw, base_pitch, elbow_pitch, "
                                     "wrist_roll, wrist_pitch。只填要动的关节，未填的自动维持上一段值。\n"
                                     "各关节范围与 HOME：\n"
-                                    "  base_yaw   [-91,95]  HOME≈18  负=左，正=右\n"
-                                    "  base_pitch [-95,95]  HOME≈-12 负=直立/后仰，正=前倾\n"
-                                    "  elbow_pitch [30,95] HOME≈53 小=上臂竖直，大=上臂折叠\n"
+                                    "  base_yaw   [-91,95]  HOME≈14  负=左，正=右\n"
+                                    "  base_pitch [-95,95]  HOME≈-38 负=直立/后仰，正=前倾\n"
+                                    "  elbow_pitch [30,95] HOME≈61 小=上臂竖直，大=上臂折叠\n"
                                     "  wrist_roll [-95,76]  HOME≈-6  负=左歪，正=右歪\n"
-                                    "  wrist_pitch [-92,72] HOME≈55 越小=越抬头，越大=越低垂（⚠️方向反直觉）\n"
+                                    "  wrist_pitch [-92,72] HOME≈5  越小=越抬头，越大=越低垂（⚠️方向反直觉）\n"
                                     "⚠️ 超出范围的值会被拒绝，严格遵守每个关节的上下限！"
                                 )
                             },
