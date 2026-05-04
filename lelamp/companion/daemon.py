@@ -112,6 +112,30 @@ class CompanionHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.exception("handle_reset 异常")
                 self._send(500, {"ok": False, "error": str(e)})
+        elif self.path == "/face":
+            # persona 模式表情:main_persona 通过此路由调 set_face,daemon 走 USB 下发
+            # 设备根据 display_mode 决定渲染或 store_only(协议 v0.5.0 §6.6)
+            try:
+                face = body.get("face", "")
+                if not face:
+                    self._send(400, {"ok": False, "error": "missing face"})
+                    return
+                _machine._disp.set_face(face)
+                self._send(200, {"ok": True})
+            except Exception as e:
+                logger.exception("handle_face 异常")
+                self._send(500, {"ok": False, "error": str(e)})
+        elif self.path == "/arc":
+            try:
+                arc = body.get("arc", "")
+                if not arc:
+                    self._send(400, {"ok": False, "error": "missing arc"})
+                    return
+                _machine._disp.play_arc(arc)
+                self._send(200, {"ok": True})
+            except Exception as e:
+                logger.exception("handle_arc 异常")
+                self._send(500, {"ok": False, "error": str(e)})
         elif self.path == "/shutdown":
             self._send(200, {"ok": True})
             # 让主线程退出 serve_forever
@@ -401,6 +425,8 @@ def main() -> int:
     log.info("  POST /event    canonical event 入口")
     log.info("  POST /update   partial snapshot patch")
     log.info("  POST /reset    手动清掉所有非默认 session(屏角清屏)")
+    log.info("  POST /face     persona 模式表情(set_face, v0.5.0)")
+    log.info("  POST /arc      persona 模式表情剧本(play_arc, v0.5.0)")
     log.info("  POST /shutdown 优雅关闭")
 
     exit_code = 0

@@ -44,6 +44,8 @@
 | `set_session_pips` | 多 session 状态点(屏角) | `pips`(array) | — |
 | `set_activity_log` | 底部活动日志 strip | `entries`(array of string) | — |
 | `set_tokens` | 今日累计 tokens 数字 | `today`(整数) | — |
+| `set_face` | 设置表情(persona 模式) | `face`(string,枚举) | — |
+| `play_arc` | 播放表情剧本(persona 模式) | `arc`(string,枚举) | — |
 
 ### 2.2 设备 → Mac(事件 / Event,ack / Ack)
 
@@ -55,6 +57,8 @@
 | `evt: approval` | 用户在 attention 屏点 ✓ 或 ✗ | `evt`, `id`, `decision`("yes"\|"no") |
 | `evt: tap` | 通用屏触摸(非按钮区) | `evt`, `x`, `y` |
 | `evt: imu` | IMU 检测到拍打/摇晃/翻转 | `evt`, `type`("tap"\|"shake"\|"tilt") |
+| `evt: long_press` | 屏幕分区长按(用于 mode 切换等) | `evt`, `zone`, `duration_ms` |
+| `evt: mode_changed` | display_mode 切换(由长按触发) | `evt`, `mode`, `trigger` |
 | `ack` | 每条命令的回执 | `ack`(原 cmd 名), `ok`(bool), 可选 `error`, 可选 `seq` |
 
 ---
@@ -303,6 +307,74 @@
 
 ---
 
+### 3.10 `set_face`(v0.5.0)
+
+**Mac 发送**:
+```json
+{"cmd":"set_face","face":"warm_smile"}
+```
+
+**设备回**:
+```json
+{"ack":"set_face","ok":true}
+```
+
+未知 face → ack ok=false, error="unknown_face"。
+
+**face 枚举**(16 个,跟 `xq_face.h` 对齐,协议层用 lower_snake_case 去掉 `XQ_` 前缀):
+
+```
+neutral, focus, idle_watch, sleep, content, warm_smile, listen, comfort,
+wink, smirk, side_eye, peek, surprised, blush, sleepy, love
+```
+
+**行为**:
+- 仅在 `display_mode=persona` 时**渲染**(切换主屏面部表情)
+- `display_mode=buddy` 时 ack ok=true 但**只 store 不渲染**;切回 persona 时用 store 的最新 face 重绘
+- play_arc 期间收到 set_face → ack ok=true,detail="arc_in_progress",**忽略**(arc 优先)
+- 过渡时长固件硬编码 300ms(150ms fade-out + 150ms fade-in),Mac 不传 `transition_ms`
+
+**频率**:Mac 在情绪变化时发,不超过 1Hz。
+
+---
+
+### 3.11 `play_arc`(v0.5.0)
+
+**Mac 发送**:
+```json
+{"cmd":"play_arc","arc":"morning"}
+```
+
+**设备回**:
+```json
+{"ack":"play_arc","ok":true}
+```
+
+未知 arc → ack ok=false, error="unknown_arc"。
+
+**arc 枚举**(6 个,跟 `xq_arcs.h` 对齐):
+
+| arc | 含义 | 步骤序列 |
+|---|---|---|
+| `morning` | 早安 | sleep → sleepy → surprised → focus → content → warm_smile |
+| `pat` | 摸摸头 | neutral → surprised → blush → warm_smile → love → content |
+| `tease` | 调皮 | neutral → side_eye → smirk → wink → content |
+| `goodnight` | 晚安(永停 sleep) | warm_smile → content → listen → sleepy → sleep |
+| `noticed` | 被发现 | idle_watch → peek → surprised → blush → warm_smile |
+| `comfort` | 安慰 | listen → comfort → warm_smile → content |
+
+**行为**:
+- 仅在 `display_mode=persona` 时渲染;buddy 模式 ack ok=true 但 store 不渲染
+- arc 内部步骤间过渡时长 600ms,设备自主切换内部 face,Mac 不需要逐帧推
+- 进行中收到新 `play_arc` → **立即打断旧 arc 切到新 arc**(不排队)
+- 进行中收到 `set_face` → 见 §3.10
+- arc 结束行为:
+  - `goodnight` 永停 `sleep` 帧(直到下一次 `set_face` / `play_arc` 唤醒)
+  - 其他 arc 停在最后一帧(不自动回 neutral),设备 idle 自治继续(blink/breath)
+  - 如果 Mac 想回 neutral,在 arc 完成后自己发 `set_face neutral`
+
+---
+
 ## 4. 事件详细规范
 
 ### 4.1 `evt: ready`
@@ -361,6 +433,44 @@
 
 ---
 
+### 4.5 `evt: long_press`(v0.5.0)
+
+**触发**:屏幕分区长按 ≥ 800ms 后**释放**触发(短于 800ms 走 `evt:tap`)
+
+**设备发送**:
+```json
+{"evt":"long_press","zone":"bottom_left","duration_ms":850}
+```
+
+**字段**:
+- `zone` —— 触摸区域语义标签(`bottom_left` / `bottom_right` / `top_left` / `top_right` / `center`)
+- `duration_ms` —— 实际按住毫秒数(用于 Mac 确认是真长按)
+
+**当前用途**:`bottom_left`(约 120×120 px 区域)长按触发设备本地 `display_mode` 切换(persona ↔ buddy)。其他 zone 留给将来扩展(亮度、音量、shortcut)。
+
+**视觉反馈**:固件在长按到 800ms 时屏闪一下确认即将切换(类似 iOS 长按抖动),减少用户误触感。
+
+---
+
+### 4.6 `evt: mode_changed`(v0.5.0)
+
+**触发**:`display_mode` 切换完成(由 `evt:long_press bottom_left` 内部触发,设备本地状态机转换)。
+
+**设备发送**:
+```json
+{"evt":"mode_changed","mode":"persona","trigger":"long_press_bottom_left"}
+```
+
+**字段**:
+- `mode` —— 切换后的目标(`persona` / `buddy`)
+- `trigger` —— 切换原因(本期只有 `long_press_bottom_left`,将来可扩 voice / api 等)
+
+**Mac 用途**:**只做日志**。Mac 端两个 daemon(persona main + buddy daemon)持续发各自命令(确保设备 store 最新),不据此事件改行为。
+
+**持久化**:固件在切换完成时写 NVS 记录当前 mode,下次开机用上次 mode 作默认(无 NVS 默认 persona)。
+
+---
+
 ## 5. ack 详细规范
 
 每条命令**必须**有对应的 ack 响应。
@@ -385,7 +495,12 @@
 | `invalid_value` | 字段值非法(超范围、错类型) |
 | `unknown_state` | set_state 的 state 不识别 |
 | `unknown_text_id` | set_text 的 id 不识别 |
+| `unknown_face` | set_face 的 face 不识别(v0.5.0) |
+| `unknown_arc` | play_arc 的 arc 不识别(v0.5.0) |
 | `busy_only` | 命令仅在 busy 状态有效(可选,也可静默忽略) |
+
+**ack 附带 detail**(v0.5.0):
+- `arc_in_progress` —— set_face 在 play_arc 进行时被忽略,但仍 ack ok=true
 
 ---
 
@@ -396,9 +511,13 @@
 ```
 设备开机
   ↓
-loading 屏(可选,1-2 秒,如有资源加载)
+ST_BOOT 屏(品牌瞬间,300ms)
   ↓
-进入 sleep 状态
+读 NVS 取 display_mode(无值默认 persona)
+  ↓
+fade 进对应 mode 的初始屏:
+  - persona → face_screen 渲染 neutral
+  - buddy → ST_IDLE 屏
   ↓
 发送 {"evt":"ready",...}
   ↓
@@ -430,6 +549,30 @@ Mac 端探测到 USB CDC 设备后,**重新发**:
 
 如果 Mac 在 1 秒内连发多个 set_state,设备**只生效最后一条**,中间动画可被打断。
 
+### 6.6 双模式渲染规则(v0.5.0)
+
+设备本地维护 `display_mode` 状态(`persona` / `buddy`),由 `evt:long_press bottom_left` 切换并写 NVS 持久化。
+
+**Mac 端不需要知道当前 mode** —— 持续发送各自命令,设备根据 mode 决定渲染哪一组,**两套命令互不影响**。
+
+| 命令 / 字段 | persona 模式 | buddy 模式 |
+|---|---|---|
+| `set_face` / `play_arc` | **渲染** | ack ok=true,**store 不渲染** |
+| `set_state` / `set_progress` / `set_text` | ack ok=true,**store 不渲染** | **渲染** |
+| `show_prompt` | ack ok=true,**store 不渲染** | **渲染**(NEEDS YOU + 按钮) |
+| `set_session_pips` | ack ok=true,**store 不渲染** | **渲染**(屏角点 + label) |
+| `set_activity_log` | ack ok=true,**store 不渲染** | **渲染**(底部 strip) |
+| `set_tokens` | ack ok=true,**store 不渲染** | **渲染**(右下数字) |
+
+**关键约束**:不渲染时也要 store 最新值。**切换 mode 瞬间**用 store 的最新数据**重绘**新 mode UI,不需要 Mac 重发命令。这样切换不丢上下文。
+
+**Mac 端建议**(非协议强制):
+- persona 模式入口(`main_persona.py`)持续调 `set_face` / `play_arc`
+- buddy 模式 daemon 后台常驻,持续调 `set_state` / `show_prompt` / 等
+- 两个 daemon 互不感知,设备分流即可
+
+**审批限制**:persona 模式下 `show_prompt` 不渲染 → 用户**不能直接审批 cc tool call**,必须长按切到 buddy 才能批。这是当前迭代的预期行为(默认场景普通用户不开 cc,无审批需求)。
+
 ---
 
 ## 7. 协议版本
@@ -443,6 +586,7 @@ Mac 端探测到 USB CDC 设备后,**重新发**:
 | 0.3.0 | 2026-04-29 | 新增 `set_session_pips` 命令(多终端 Claude Code 并发时屏角状态点) |
 | 0.4.0 | 2026-05-02 | 新增 `set_activity_log`(底部事件流 strip)与 `set_tokens`(今日累计)两个命令;无 breaking change |
 | 0.4.1 | 2026-05-04 | `set_session_pips` 行为变更:N≥1 时下发(含单 session),让设备 session count label 能显示真实数量;之前 N≤1 不发导致 label 显 "0 sessions" |
+| 0.5.0 | 2026-05-04 | 双模式陪伴机器人:新增 `set_face` / `play_arc` 命令(persona 模式表情驱动)、`evt:long_press` / `evt:mode_changed` 事件、§6.6 双模式渲染规则。设备本地 `display_mode` 状态机由长按屏左下角 800ms 切换 + NVS 持久化。Mac 持续发两套命令设备分流。无 breaking change |
 
 未来变更**必须**:
 - 单调递增版本号

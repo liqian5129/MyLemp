@@ -8,7 +8,7 @@
   - 命令发送 fire-and-forget,不阻塞主线程
   - mock 模式:不连真硬件,把发出的 JSON 打印,模拟 ack
 
-协议版本:v0.4.0(含 set_activity_log / set_tokens)
+协议版本:v0.5.0(含 set_face / play_arc;persona/buddy 双模式)
 """
 from __future__ import annotations
 
@@ -185,13 +185,45 @@ class DisplayController:
         """
         self._send({"cmd": "set_tokens", "today": max(0, int(today))})
 
+    def set_face(self, face: str) -> None:
+        """设置表情(协议 v0.5.0,persona 模式渲染)。
+
+        face: 16 个枚举之一,跟 xq_face.h 对齐(lower_snake_case 去 XQ_ 前缀):
+              neutral / focus / idle_watch / sleep / content / warm_smile /
+              listen / comfort / wink / smirk / side_eye / peek /
+              surprised / blush / sleepy / love
+
+        行为(协议 §3.10):
+          - persona 模式:渲染 face,300ms 淡入淡出过渡
+          - buddy 模式:ack ok=true 但 store 不渲染,切回 persona 重绘
+          - play_arc 进行时:ack ok=true detail=arc_in_progress,被忽略
+
+        频率:不超过 1Hz。
+        """
+        self._send({"cmd": "set_face", "face": str(face)})
+
+    def play_arc(self, arc: str) -> None:
+        """播放表情剧本(协议 v0.5.0,persona 模式渲染)。
+
+        arc: 6 个枚举之一,跟 xq_arcs.h 对齐:
+             morning / pat / tease / goodnight / noticed / comfort
+
+        行为(协议 §3.11):
+          - persona 模式:演完整套剧本,内部步骤间 600ms 过渡
+          - 进行中收到新 play_arc → 立即打断切到新 arc
+          - 进行中收到 set_face → 被忽略
+          - goodnight 永停 sleep 帧;其他 arc 停最后一帧
+        """
+        self._send({"cmd": "play_arc", "arc": str(arc)})
+
     def send_raw(self, payload: dict) -> None:
         """直接发送任意 payload(供测试 / 自定义命令用)。
         跟其他命令方法一样 fire-and-forget,绕过任何客户端校验。"""
         self._send(payload)
 
     # 关键命令打 INFO log,便于诊断设备渲染问题;高频命令走 DEBUG 避免刷屏
-    _LOG_INFO_CMDS = {"set_state", "show_prompt", "set_brightness", "set_session_pips"}
+    _LOG_INFO_CMDS = {"set_state", "show_prompt", "set_brightness", "set_session_pips",
+                      "set_face", "play_arc"}
 
     def _send(self, payload: dict) -> None:
         line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n"
