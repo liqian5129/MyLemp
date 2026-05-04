@@ -225,7 +225,9 @@
 
 **特殊**:`pips: []` 表示无 active session,屏角清空。
 
-**用途**:多终端 Claude Code 并发时,屏角加 N 个状态点呈现所有 active session 的状态(主屏视觉走 winner)。Mac daemon 在 N≥2 时下发,N≤1 时不下发(或下发空 list 清屏)。
+**用途**:多终端 Claude Code 并发时,屏角加 N 个状态点呈现所有 active session 的状态(主屏视觉走 winner)。Mac daemon 在 N≥1 时下发(含单 session,让设备的 session count label 能显示真实数量),N=0 时下发空 list 清屏。
+
+**v0.4.1 行为变更**:之前 N≤1 不下发,导致设备 label 不知道有几个 session。现在单 session 也发,设备视觉上是否渲染屏角点由设备自决,但 label 应按 pips.length 显示真实数。
 
 **视觉规则**(参考实现,Agent B 决定细节):
 - 位置:屏右上角,从右到左排列,2px 间距
@@ -440,6 +442,7 @@ Mac 端探测到 USB CDC 设备后,**重新发**:
 | 0.2.2 | 2026-04-29 | celebrate 时长 3s → 4s(用户实测 3s 仍偏短) |
 | 0.3.0 | 2026-04-29 | 新增 `set_session_pips` 命令(多终端 Claude Code 并发时屏角状态点) |
 | 0.4.0 | 2026-05-02 | 新增 `set_activity_log`(底部事件流 strip)与 `set_tokens`(今日累计)两个命令;无 breaking change |
+| 0.4.1 | 2026-05-04 | `set_session_pips` 行为变更:N≥1 时下发(含单 session),让设备 session count label 能显示真实数量;之前 N≤1 不发导致 label 显 "0 sessions" |
 
 未来变更**必须**:
 - 单调递增版本号

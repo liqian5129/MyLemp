@@ -143,6 +143,27 @@ class SessionStateMachine:
             logger.info("移除 session %s", session_id)
             self._reconcile()
 
+    def bulk_register_sessions(self, sids: list[str]) -> int:
+        """批量注册 session 占位(daemon 启动时 bootstrap 用)。
+
+        所有 sid 注册为 idle 状态,**最后只 reconcile 一次**。避免 N 次 reconcile
+        导致 N 条 set_session_pips 突发(可能撑爆设备 USB CDC RX buffer)。
+        """
+        if not sids:
+            return 0
+        with self._lock:
+            count = 0
+            for sid in sids:
+                if not sid or sid == self.DEFAULT_SID:
+                    continue
+                if sid in self._sessions:
+                    continue  # 已存在跳过
+                self._sessions[sid] = initial_snapshot()
+                count += 1
+        if count > 0:
+            self._reconcile()
+        return count
+
     def get_sessions(self) -> dict[str, SessionSnapshot]:
         """返回所有 session 的副本(供 /state 调试)。"""
         with self._lock:
@@ -372,15 +393,17 @@ class SessionStateMachine:
         # 数实际的非默认 session(_default 是占位,不算)
         active_sids = [sid for sid in sessions.keys() if sid != self.DEFAULT_SID]
 
-        if len(active_sids) <= 1:
-            # 单 session 或更少 → 屏角应空。
-            # 注意:**也要在启动时**(last_pips_sig=None)发一次空 list,
-            # 因为设备可能还残留前一次 daemon run 留下的 pips
+        if len(active_sids) == 0:
+            # 完全没活跃 session → 发空 list 让设备清屏角
+            # (启动时 last_pips_sig=None 也发,清前一次 daemon 残留)
             if self._last_pips_sig != ():
                 self._send_pips([])
                 self._last_pips_sig = ()
             return
 
+        # N≥1 全部下发(含单 session)。设备侧 session count label 从 pips.length 派生,
+        # 单 session 也要显示"1 sessions",所以这里不再 ≤1 时清空。
+        # 视觉上单 session 是否渲染屏角点由设备自决(协议未强制)。
         pips = []
         for sid in active_sids:
             snap = sessions[sid]

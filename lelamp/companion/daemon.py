@@ -202,7 +202,9 @@ def handle_event(machine: SessionStateMachine, body: dict) -> dict:
         return {"ok": True, "decision": None}
 
     if event_type == "tool_completed":
-        machine.mutate(session_id=sid, current_tool=None)
+        # 关键:清 prompt(用户在 attention 屏批了 yes 后,tool 执行完此 hook fire,
+        # 派生应从 attention 回到 busy)。不清 prompt 会一直死挂 attention 到 Stop。
+        machine.mutate(session_id=sid, current_tool=None, prompt=None)
         return {"ok": True, "decision": None}
 
     if event_type == "task_completed":
@@ -367,6 +369,30 @@ def main() -> int:
     project_dir = Path.home() / ".claude" / "projects" / encode_cwd_to_project_dir(cwd)
     watcher = TranscriptWatcher(project_dir, on_tokens_change=_machine.set_tokens_today)
     watcher.start()
+
+    # ---- bootstrap 已活跃的 session(daemon 启动前已开的 cc)----
+    # daemon 不能"扫描进程",但 Claude Code transcript jsonl mtime 能反映 session 活跃度。
+    # 扫 project_dir 下 mtime 在 SESSION_IDLE_TTL(15min) 内的 jsonl,
+    # 把 session_id(文件名 stem)懒注册为 idle 占位。后续 hook 事件覆盖真实状态;
+    # 无事件的话 SESSION_IDLE_TTL GC 会自动清掉,不留鬼 session。
+    if project_dir.exists():
+        from lelamp.companion.snapshot import SESSION_IDLE_TTL  # noqa: E402
+        now_wall = time.time()
+        cutoff = now_wall - SESSION_IDLE_TTL
+        active_sids = []
+        for f in project_dir.glob("*.jsonl"):
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            sid = f.stem
+            if sid:
+                active_sids.append(sid)
+        n = _machine.bulk_register_sessions(active_sids)
+        if n:
+            log.info("Bootstrap 已注册 %d 个活跃 session(从 transcript mtime 推断,15min 内有更新)", n)
 
     # ---- 启动 HTTP server ----
     server = ThreadingHTTPServer(("127.0.0.1", args.port), CompanionHandler)
