@@ -62,13 +62,21 @@ def _parse_iso_to_epoch(ts: str) -> Optional[float]:
 
 
 def _sum_usage(usage: dict) -> int:
-    """对 input + cache_creation + cache_read + output 求和。"""
+    """对 input + output 求和(口径 B,纯计费 token)。
+
+    不含 cache_creation / cache_read,这俩在 Anthropic 计费侧分别是 1.25× / 0.1×
+    单价,但**字节量**会让 prompt cache 反复复用时数字膨胀(94% 来自 cache_read,
+    145 条 message 就 ~90M)。屏上显示更想要"今天实际花了多少钱"的直观数字,
+    所以只算 input + output。
+
+    口径切换历史:
+      v0.4.0 初版: 含 cache 总和(93M/天)
+      v0.5.x:      切换到 input + output(几百 K/天,直觉上更有意义)
+    """
     if not isinstance(usage, dict):
         return 0
     return (
         int(usage.get("input_tokens", 0) or 0)
-        + int(usage.get("cache_creation_input_tokens", 0) or 0)
-        + int(usage.get("cache_read_input_tokens", 0) or 0)
         + int(usage.get("output_tokens", 0) or 0)
     )
 

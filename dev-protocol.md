@@ -293,9 +293,10 @@
 
 **累计口径**(Mac 端):
 - 来自 Claude Code transcript JSONL(`~/.claude/projects/<encoded-cwd>/*.jsonl`)
-- 对所有 `type=assistant` 消息求和:`input_tokens + cache_creation_input_tokens + cache_read_input_tokens + output_tokens`
+- 对所有 `type=assistant` 消息求和:`input_tokens + output_tokens`(纯计费侧,不含 cache_read / cache_creation)
 - 范围:仅本项目(daemon 启动 cwd 对应的 projects 目录),跨项目不合并
 - 跨日 0:00 重置
+- v0.4.0 初版含 cache 总和导致单日 90M+ 太惊人,后切纯计费口径(单日几百 K,跟用户花钱直觉对齐)
 
 **频率约束**:
 - Mac 端节流:累计变化 ≥100 tokens **或** 距上次推送 ≥30s 才发
