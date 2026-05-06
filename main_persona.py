@@ -187,10 +187,12 @@ async def main():
     # BuddyAwareness 用 _orig_play_keyframes 引用绕过 gate 直接调原方法。
     device_mode_box: list[str] = ["persona"]
 
+    # 注:SoulAgent 的 body_move tool 内部调 motion_agent.play_waypoint,
+    # 所以 patch play_waypoint 而非 body_move(MotionAgent 没这方法)。
     _orig_play_emotion   = motion_svc.play_emotion
     _orig_play_compose   = motion_svc.play_compose
     _orig_play_keyframes = motion_svc.play_keyframes
-    _orig_body_move      = motion_svc.body_move
+    _orig_play_waypoint  = motion_svc.play_waypoint
 
     def _gate(name: str, orig):
         def wrapper(*args, **kwargs):
@@ -203,7 +205,7 @@ async def main():
     motion_svc.play_emotion   = _gate("play_emotion",   _orig_play_emotion)
     motion_svc.play_compose   = _gate("play_compose",   _orig_play_compose)
     motion_svc.play_keyframes = _gate("play_keyframes", _orig_play_keyframes)
-    motion_svc.body_move      = _gate("body_move",      _orig_body_move)
+    motion_svc.play_waypoint  = _gate("play_waypoint",  _orig_play_waypoint)
     logger.info("🚦 motion gate 已装(persona 透传,buddy 拦截 SoulAgent)")
 
     # ── RGB 服务 ──────────────────────────────────────────────────────────────
