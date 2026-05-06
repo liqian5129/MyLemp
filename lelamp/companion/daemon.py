@@ -79,6 +79,7 @@ class CompanionHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "state": agg_state,
                 "winner_sid": winner_sid,
+                "device_mode": _machine.get_device_mode(),  # v0.5.1
                 "snapshot": _snapshot_to_dict(winning_snap),  # 向后兼容:winning 那个
                 "sessions": {sid: _snapshot_to_dict(s) for sid, s in sessions.items()},
             })

@@ -79,6 +79,10 @@ class SessionStateMachine:
         self._last_tokens_sent: Optional[int] = None
         self._last_tokens_dispatch: float = 0.0
 
+        # device_mode 跟随设备(协议 v0.5.1):evt:ready 带 mode 时初始化,
+        # evt:mode_changed 运行时更新。Mac 端用它做 motion 互斥(persona/buddy)。
+        self._device_mode: str = "persona"
+
         self._stop_event = threading.Event()
         self._tick_thread: Optional[threading.Thread] = None
 
@@ -97,19 +101,33 @@ class SessionStateMachine:
         # 监听设备 boot/重连信号(evt=ready),清下发缓存让下一次 reconcile
         # 强制重发 set_state / show_prompt / pips,让设备重连后跟上 daemon 状态
         try:
-            self._disp.on("ready", lambda evt: self._on_device_ready())
+            self._disp.on("ready", lambda evt: self._on_device_ready(evt))
         except Exception:
             logger.exception("注册 ready 回调失败")
+        # 监听 mode 切换(协议 v0.5.0 evt:mode_changed,长按 bottom_left 触发)
+        try:
+            self._disp.on("mode_changed", lambda evt: self._on_mode_changed(evt))
+        except Exception:
+            logger.exception("注册 mode_changed 回调失败")
         logger.info("SessionStateMachine 已启动")
 
-    def _on_device_ready(self) -> None:
+    def _on_device_ready(self, evt: Optional[dict] = None) -> None:
         """设备发 evt=ready(boot/重连后)→ 强制重新下发当前状态。
 
         清掉 _last_dispatched_state / _last_pips_sig / _last_prompt_key /
         _info_cache 让下一次 _reconcile 视为状态变化,把当前 winner 的 state /
         prompt / pips / text 全部重发,设备 boot 后能快速恢复。
+
+        协议 v0.5.1:evt:ready 可能带 mode 字段(NVS 存的 display_mode),
+        daemon 重启后接到 ready 一并恢复 _device_mode,避免跟设备实际 mode 不一致。
         """
         logger.info("设备 evt=ready → 强制下次 reconcile 重发完整状态")
+        # v0.5.1:从 evt 里读 mode 字段(没有则保持现值,不退到默认)
+        if evt is not None:
+            mode = evt.get("mode")
+            if mode in ("persona", "buddy") and mode != self._device_mode:
+                logger.info("evt=ready 同步 device_mode %s → %s", self._device_mode, mode)
+                self._device_mode = mode
         self._last_dispatched_state = None
         self._last_pips_sig = None
         self._last_prompt_key = None
@@ -121,6 +139,21 @@ class SessionStateMachine:
             self._reconcile()
         except Exception:
             logger.exception("ready 回调 reconcile 异常")
+
+    def _on_mode_changed(self, evt: dict) -> None:
+        """设备发 evt:mode_changed(长按 bottom_left 切换)→ 更新内存 _device_mode。
+
+        Mac 端 BuddyAwareness 通过 GET /state 拿到这个值,做 motion 互斥决策。
+        """
+        new_mode = evt.get("mode", "persona")
+        if new_mode in ("persona", "buddy") and new_mode != self._device_mode:
+            logger.info("device_mode %s → %s (trigger=%s)",
+                        self._device_mode, new_mode, evt.get("trigger", "?"))
+            self._device_mode = new_mode
+
+    def get_device_mode(self) -> str:
+        """供 daemon /state 返回当前 device_mode。"""
+        return self._device_mode
 
     def stop(self) -> None:
         self._stop_event.set()

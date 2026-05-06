@@ -44,7 +44,7 @@ from dotenv import load_dotenv
 
 from lelamp.agent.ai_client import AIClient
 from lelamp.motion.motion_agent import MotionAgent
-from lelamp.persona import FaceDirector
+from lelamp.persona import FaceDirector, BuddyAwareness
 from lelamp.service.rgb.rgb_service import RGBService
 from lelamp.soul.camera_capture import CameraCapture
 from lelamp.soul.memory import HistoryDB, IdentityMemory, MemoryStream, LongTermMemory
@@ -164,9 +164,47 @@ async def main():
 
     # ── 运动服务 ──────────────────────────────────────────────────────────────
     motion_svc = MotionAgent(port=port, lamp_id="lelamp", fps=30)
-    motion_svc.start()
+    try:
+        motion_svc.start()
+    except Exception as e:
+        logger.error("舵机启动失败: %s", e)
+        logger.error("─" * 60)
+        logger.error("物理排查清单(按概率从高到低):")
+        logger.error("  1. 12V 电源适配器是否插好,LED 是否亮")
+        logger.error("  2. 主控板 DC 接头是否插紧")
+        logger.error("  3. 舵机串联线是否松动(5 个 servo 串联,第一个断后面全断)")
+        logger.error("  4. 通电瞬间 5 个舵机有无'咔哒'声(torque self-test)")
+        logger.error("─" * 60)
+        logger.error("修复后跑: uv run python scripts/scan_motors.py --port %s", port)
+        logger.error("应见 ID 1-5 全部响应,然后再 ./scripts/start_persona.sh")
+        return  # 直接退出 main(),不启 face/语音(SoulAgent 强依赖 motion_svc)
     if os.environ.get("MOTION_RECORD", "").lower() in ("1", "true", "yes"):
         motion_svc.start_recording("data/motion_record.csv")
+
+    # ── device_mode 互斥 gate(协议 v0.5.1)──────────────────────────────────
+    # BuddyAwareness 维护 device_mode_box[0],SoulAgent 的 motion 调用全部经过
+    # _gate 包装,buddy 模式时拦截(让 BuddyAwareness 主导 buddy motion)。
+    # BuddyAwareness 用 _orig_play_keyframes 引用绕过 gate 直接调原方法。
+    device_mode_box: list[str] = ["persona"]
+
+    _orig_play_emotion   = motion_svc.play_emotion
+    _orig_play_compose   = motion_svc.play_compose
+    _orig_play_keyframes = motion_svc.play_keyframes
+    _orig_body_move      = motion_svc.body_move
+
+    def _gate(name: str, orig):
+        def wrapper(*args, **kwargs):
+            if device_mode_box[0] == "buddy":
+                logger.debug("buddy 模式跳过 SoulAgent.%s", name)
+                return None
+            return orig(*args, **kwargs)
+        return wrapper
+
+    motion_svc.play_emotion   = _gate("play_emotion",   _orig_play_emotion)
+    motion_svc.play_compose   = _gate("play_compose",   _orig_play_compose)
+    motion_svc.play_keyframes = _gate("play_keyframes", _orig_play_keyframes)
+    motion_svc.body_move      = _gate("body_move",      _orig_body_move)
+    logger.info("🚦 motion gate 已装(persona 透传,buddy 拦截 SoulAgent)")
 
     # ── RGB 服务 ──────────────────────────────────────────────────────────────
     rgb_svc = RGBService(
@@ -208,6 +246,15 @@ async def main():
         return await _orig_speak(cleaned, *args, **kwargs)
 
     tts.speak = speak_with_face
+
+    # ── BuddyAwareness(协议 v0.5.1):buddy 模式下根据 cc state 驱动 lamp motion
+    # 用 _orig_play_keyframes 绕过 gate(否则 buddy 模式自己的 motion 也被拦)
+    buddy_awareness = BuddyAwareness(
+        play_keyframes_fn=_orig_play_keyframes,
+        daemon_url=daemon_url,
+        mode_box=device_mode_box,
+        poll_interval=2.0,
+    )
 
     # ── 身份识别 + 记忆 + 智能体 ────────────────────────────────────────────────
     identity_mem = IdentityMemory()
@@ -279,6 +326,7 @@ async def main():
     tts.on_play_end = ear.unmute
 
     await ear.start()
+    await buddy_awareness.start()
     await tts.speak("呼——我醒来了。")
 
     # ── 开机环境扫描 ──────────────────────────────────────────────────────────
@@ -295,6 +343,8 @@ async def main():
         # 临时禁用 play_arc(同上,Agent B 固件 bug 待修)
         face_director.set_face("sleep")  # 退场表情(替代 goodnight arc)
         await agent.shutdown()
+        # 先停 BuddyAwareness 避免 motion_svc.stop() 后还调 play_keyframes
+        await buddy_awareness.stop()
         visual_monitor.stop()
         camera.stop()
         await ear.stop()
